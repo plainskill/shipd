@@ -49,7 +49,10 @@ func main() {
 	mux.Handle("GET /api/tokens", eng.guard(http.HandlerFunc(eng.handleTokensList)))
 	mux.Handle("POST /api/tokens", eng.guard(http.HandlerFunc(eng.handleTokenCreate)))
 	mux.Handle("POST /api/tokens/{id}/revoke", eng.guard(http.HandlerFunc(eng.handleTokenRevoke)))
-	mux.Handle("GET /", eng.guard(http.HandlerFunc(eng.handleDashboard)))
+	// dashboard: unauthenticated at this layer — the abm gate at Caddy is
+	// the access control for the UI; the page authenticates API calls with
+	// a token from localStorage
+	mux.Handle("GET /{$}", http.HandlerFunc(eng.handleDashboard))
 
 	srvs := []*http.Server{newServer(cfg.Listen, mux)}
 	for _, addr := range cfg.ListenExtra {

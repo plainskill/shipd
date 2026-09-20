@@ -52,9 +52,19 @@ deploy key / credential for the URL.
 
 Managed tokens authenticate exactly like the root token (Basic auth,
 any username). Hashes only in state; plaintext shown once at creation.
-Manage them from the dashboard (apps.plainskill.net) — the dashboard and
-API sit behind the same abm gate as other plainskill.net portals, except
-/api/*, /check and /healthz which are token-authed for programmatic use.
+
+### Access model
+
+The dashboard is an exposed portal behind the plainskill.net abm gate
+(same as every user-facing page here). No Basic-auth wall in the browser:
+the page renders once you pass the gate, you paste an API token into the
+"access" panel (stored in localStorage) and the UI authenticates its own
+API calls with it. Token management lives in that same panel.
+
+At the Caddy layer the shipd vhosts abm-gate everything EXCEPT /api/*,
+/check and /healthz — those stay token-authed for curl/CI use.
+At the shipd layer, GET / serves the static page; every /api/* and
+state-changing path requires a token.
 
 ## How a deploy works
 
