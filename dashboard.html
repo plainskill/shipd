@@ -124,7 +124,7 @@ function loadApps() {
         + '<button class="quiet" data-act="redeploy" data-sub="' + esc(a.subdomain) + '">redeploy</button> &nbsp; '
         + (a.desired_up
             ? '<button class="quiet" data-act="stop" data-sub="' + esc(a.subdomain) + '">stop</button> &nbsp; '
-            : '<button class="quiet" data-act="start" data-sub="' + esc(a.subdomain) + '">start</button> &nbsp; ')'
+            : '<button class="quiet" data-act="start" data-sub="' + esc(a.subdomain) + '">start</button> &nbsp; ')
         + '<button class="quiet warn" data-act="delete" data-sub="' + esc(a.subdomain) + '">delete</button>'
         + '</div></div>';
     }
@@ -238,7 +238,7 @@ document.getElementById("tokform").addEventListener("submit", function(ev) {
       box.innerHTML = '<div class="msg ok">token created. copy it now — it is shown once:</div>'
         + '<pre class="token">' + esc(res.body.token) + '</pre>'
         + '<div class="msg body">CLI: <code>shipd login ' + esc(res.body.token) + '</code></div>'
-        + '<div class="msg body">API: <code>curl -u shipd:' + esc(res.body.token) + ' https://shipd.plainskill.net/api/apps</code></div>';
+        + '<div class="msg body">API: <code>curl -u shipd:' + esc(res.body.token) + ' ' + esc(window.location.origin) + '/api/apps</code></div>';
       document.getElementById("tokname").value = "";
       loadTokens();
     } else {
