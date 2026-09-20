@@ -34,7 +34,10 @@ say "platform: ${os}/${arch} → ${asset}"
 
 # --- resolve release --------------------------------------------------
 if [ -z "$VERSION" ]; then
-  api="$RELEASE_BASE/api/v1/repos/plainskill/shipd/releases?limit=1"
+  # derive the API endpoint from the repo base so any forge works
+  origin=$(printf '%s' "$RELEASE_BASE" | sed -E 's|^(https?://[^/]+).*|\1|')
+  repo_path=$(printf '%s' "$RELEASE_BASE" | sed -E 's|^https?://[^/]+/||')
+  api="$origin/api/v1/repos/$repo_path/releases?limit=1"
   VERSION=$(curl -fsSL "$api" 2>/dev/null | sed -n 's/.*"tag_name":"\([^"]*\)".*/\1/p' | head -1)
   [ -n "$VERSION" ] || die "could not determine the latest release from $api"
 fi
