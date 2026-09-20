@@ -2,15 +2,24 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"time"
 )
 
+// version is stamped at build time: -ldflags "-X main.version=v1.2.3"
+var version = "dev"
+
 func main() {
 	configPath := flag.String("config", "/etc/shipd/config.json", "path to config JSON")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 
 	cfg, err := LoadConfig(*configPath)
 	if err != nil {
@@ -47,24 +56,28 @@ func main() {
 	mux.Handle("GET /api/apps/{subdomain}/logs", eng.guard(http.HandlerFunc(eng.handleLogs)))
 	// token management (root or any active managed token)
 	mux.Handle("GET /api/tokens", eng.guard(http.HandlerFunc(eng.handleTokensList)))
+	mux.Handle("GET /api/whoami", eng.guard(http.HandlerFunc(eng.handleWhoami)))
+	mux.Handle("POST /api/delete", eng.guard(http.HandlerFunc(eng.handleDeleteByIdentity)))
 	mux.Handle("POST /api/tokens", eng.guard(http.HandlerFunc(eng.handleTokenCreate)))
 	mux.Handle("POST /api/tokens/{id}/revoke", eng.guard(http.HandlerFunc(eng.handleTokenRevoke)))
 	// dashboard endpoints: NO token auth at this layer — the abm gate at
 	// Caddy is the access control for the UI. API tokens are exclusively
 	// for programmatic deploys.
-	mux.HandleFunc("GET /dash/apps", handleAppsList(st))
-	mux.HandleFunc("POST /dash/deploy", eng.handleDeploy)
-	mux.HandleFunc("POST /dash/apps/{subdomain}/stop", eng.handleAction(actionStop))
-	mux.HandleFunc("POST /dash/apps/{subdomain}/start", eng.handleAction(actionStart))
-	mux.HandleFunc("POST /dash/apps/{subdomain}/redeploy", eng.handleAction(actionRedeploy))
-	mux.HandleFunc("POST /dash/apps/{subdomain}/delete", eng.handleAction(actionDelete))
-	mux.HandleFunc("GET /dash/apps/{subdomain}/logs", eng.handleLogs)
-	mux.HandleFunc("GET /dash/tokens", eng.handleTokensList)
-	mux.HandleFunc("POST /dash/tokens", eng.handleTokenCreate)
-	mux.HandleFunc("POST /dash/tokens/{id}/revoke", eng.handleTokenRevoke)
-	// dashboard: unauthenticated at this layer — the abm gate at Caddy is
-	// the access control for the UI
-	mux.Handle("GET /{$}", http.HandlerFunc(eng.handleDashboard))
+	mux.Handle("GET /dash/apps", eng.gateOnly(handleAppsList(st)))
+	mux.Handle("POST /dash/deploy", eng.gateOnly(http.HandlerFunc(eng.handleDeploy)))
+	mux.Handle("POST /dash/delete", eng.gateOnly(http.HandlerFunc(eng.handleDeleteByIdentity)))
+	mux.Handle("POST /dash/apps/{subdomain}/stop", eng.gateOnly(eng.handleAction(actionStop)))
+	mux.Handle("POST /dash/apps/{subdomain}/start", eng.gateOnly(eng.handleAction(actionStart)))
+	mux.Handle("POST /dash/apps/{subdomain}/redeploy", eng.gateOnly(eng.handleAction(actionRedeploy)))
+	mux.Handle("POST /dash/apps/{subdomain}/delete", eng.gateOnly(eng.handleAction(actionDelete)))
+	mux.Handle("GET /dash/apps/{subdomain}/logs", eng.gateOnly(http.HandlerFunc(eng.handleLogs)))
+	mux.Handle("GET /dash/tokens", eng.gateOnly(http.HandlerFunc(eng.handleTokensList)))
+	mux.Handle("POST /dash/tokens", eng.gateOnly(http.HandlerFunc(eng.handleTokenCreate)))
+	mux.Handle("POST /dash/tokens/{id}/revoke", eng.gateOnly(http.HandlerFunc(eng.handleTokenRevoke)))
+	// dashboard page: unauthenticated by design (the authgate at Caddy
+	// authenticates the human) but requires the Caddy-injected gate header
+	// so sibling containers on shipd-net cannot reach it directly
+	mux.Handle("GET /{$}", eng.gateOnly(http.HandlerFunc(eng.handleDashboard)))
 
 	srvs := []*http.Server{newServer(cfg.Listen, mux)}
 	for _, addr := range cfg.ListenExtra {
@@ -74,7 +87,7 @@ func main() {
 		log.Printf("shipd: listening on %s", s.Addr)
 	}
 	log.Printf("shipd: ask URL for Caddy on_demand_tls: http://172.16.0.1:8900/check?t=<redacted — see config.json>")
-	log.Printf("shipd: zone %s (%d apps)", cfg.Domain, len(st.Apps))
+	log.Printf("shipd: version %s, zone %s (%d apps)", version, cfg.Domain, len(st.Apps))
 	for _, s := range srvs[1:] {
 		go func(s *http.Server) {
 			if err := s.ListenAndServe(); err != nil {

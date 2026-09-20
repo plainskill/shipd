@@ -41,17 +41,24 @@ func (s *State) CheckToken(rootToken, presented string) (bool, string) {
 	return false, ""
 }
 
-// TouchToken records usage. The marshal happens in Save; throttling is fine
-// because last_used_at is cosmetic.
+// TouchToken records usage, throttled to at most one state write per minute
+// per token so a polling client cannot rewrite state.json on every request.
 func (s *State) TouchToken(id string) {
 	if id == "" || id == "root" {
 		return
 	}
 	s.mu.Lock()
-	if t := s.Tokens[id]; t != nil {
-		now := time.Now().UTC()
-		t.LastUsedAt = &now
+	t := s.Tokens[id]
+	if t == nil {
+		s.mu.Unlock()
+		return
 	}
+	now := time.Now().UTC()
+	if t.LastUsedAt != nil && now.Sub(*t.LastUsedAt) < time.Minute {
+		s.mu.Unlock()
+		return
+	}
+	t.LastUsedAt = &now
 	s.mu.Unlock()
 	s.Save()
 }
@@ -87,21 +94,23 @@ type TokenView struct {
 	Name       string     `json:"name"`
 	CreatedAt  time.Time  `json:"created_at"`
 	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
-	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
 }
 
-// ListTokens returns all tokens (including revoked), newest first.
+// ListTokens returns active tokens, newest first. Revoked tokens are deleted
+// outright (a revoked token is dead weight, not history worth keeping).
 func (s *State) ListTokens() []TokenView {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]TokenView, 0, len(s.Tokens))
 	for _, t := range s.Tokens {
+		if !t.active() {
+			continue
+		}
 		out = append(out, TokenView{
 			ID:         t.ID,
 			Name:       t.Name,
 			CreatedAt:  t.CreatedAt,
 			LastUsedAt: t.LastUsedAt,
-			RevokedAt:  t.RevokedAt,
 		})
 	}
 	for i := 1; i < len(out); i++ {
@@ -112,20 +121,15 @@ func (s *State) ListTokens() []TokenView {
 	return out
 }
 
-// RevokeToken marks a token revoked; returns false if not found.
+// RevokeToken deletes a token outright; returns false if it never existed.
+// No tombstones: a revoked token is not shown in the UI and not kept in state.
 func (s *State) RevokeToken(id string) bool {
 	s.mu.Lock()
-	t := s.Tokens[id]
-	if t == nil {
+	if _, ok := s.Tokens[id]; !ok {
 		s.mu.Unlock()
 		return false
 	}
-	if t.RevokedAt != nil {
-		s.mu.Unlock()
-		return true
-	}
-	now := time.Now().UTC()
-	t.RevokedAt = &now
+	delete(s.Tokens, id)
 	s.mu.Unlock()
 	s.Save()
 	return true

@@ -16,10 +16,11 @@ type Config struct {
 	Listen string `json:"listen"` // primary listen address
 
 	// ListenExtra are additional listen addresses. Used to expose the API on
-	// a docker bridge gateway IP (e.g. 172.30.0.1:8900) so a containerized
-	// reverse proxy (Caddy) can reach the host process. Never exposed
-	// publicly: UFW default-deny covers non-loopback, and the address only
-	// exists on shipd-net.
+	// a docker bridge gateway IP (e.g. 172.16.0.1:8900, the shipd-net
+	// gateway) so a containerized reverse proxy (Caddy) can reach the host
+	// process. Never exposed publicly (UFW default-deny covers non-loopback),
+	// BUT every app container on shipd-net can also reach this address — so
+	// the dashboard paths require the Caddy-injected X-Shipd-Gate header.
 	ListenExtra []string `json:"listen_extra"`
 
 	Domain   string `json:"domain"` // e.g. apps.plainskill.net
@@ -75,6 +76,15 @@ func trimGitSuffix(s string) string {
 // the API token so there is exactly one secret to manage.
 func (c *Config) AskToken() string {
 	h := sha256.Sum256([]byte("shipd-ask:" + c.APIToken))
+	return hex.EncodeToString(h[:16])
+}
+
+// GateToken derives the shared secret Caddy injects as X-Shipd-Gate on the
+// dashboard paths. /dash/* is unauthenticated by design (the authgate at
+// Caddy authenticates users), so this header is what distinguishes a request
+// that came through Caddy from one issued by a sibling container on shipd-net.
+func (c *Config) GateToken() string {
+	h := sha256.Sum256([]byte("shipd-gate:" + c.APIToken))
 	return hex.EncodeToString(h[:16])
 }
 

@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly shipd self-update from the local registry
+
+[Timer]
+OnCalendar=Mon 04:30
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

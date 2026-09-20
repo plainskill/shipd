@@ -78,6 +78,12 @@ func LoadState(path string) (*State, error) {
 	if st.Tokens == nil {
 		st.Tokens = map[string]*TokenRecord{}
 	}
+	// prune legacy revoked records (revoke now deletes instead of tombstoning)
+	for id, t := range st.Tokens {
+		if t == nil || !t.active() {
+			delete(st.Tokens, id)
+		}
+	}
 	return st, nil
 }
 

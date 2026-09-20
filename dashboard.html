@@ -24,7 +24,6 @@
   .b-running  { color: #7ee787; border-color: #1f4a2a; }
   .b-building, .b-queued { color: #d2a8ff; border-color: #3b2a58; }
   .b-failed   { color: #ff7b72; border-color: #5a2320; }
-  .b-revoked  { color: #717174; text-decoration: line-through; }
   .meta { color: #717174; font-size: 11px; }
   .quiet { background: none; border: 0; padding: 0; font: inherit; font-size: 12px; color: #717174;
            cursor: pointer; text-decoration: underline; text-underline-offset: 3px; text-decoration-color: #2a2a2e; }
@@ -93,7 +92,7 @@ function api(path, opts) {
   return fetch(path, opts);
 }
 function esc(s) { return (s || "").replace(/[&<>"]/g, function(c) {
-  return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+  return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
 });}
 function shortRepo(u) { return u.replace(/^https?:\/\//, "").replace(/^git@/, "").replace(/\.git$/, ""); }
 function fmtDate(iso) { try { return new Date(iso).toLocaleString(); } catch (e) { return iso; } }
@@ -154,18 +153,14 @@ function loadTokens() {
     var html = "";
     for (var i = 0; i < toks.length; i++) {
       var t = toks[i];
-      var status = t.revoked_at ? "revoked" : "active";
       html += '<div class="panel">'
         + '<div class="row">'
         + '<span class="grow">' + esc(t.name) + '</span>'
-        + badge(status)
         + '</div>'
         + '<div class="meta">created ' + esc(fmtDate(t.created_at))
         + (t.last_used_at ? ' &middot; last used ' + esc(fmtDate(t.last_used_at)) : ' &middot; never used')
         + '</div>'
-        + (!t.revoked_at
-            ? '<div class="actions"><button class="quiet warn" onclick="revoke(\'' + esc(t.id) + '\',\'' + esc(t.name) + '\')">revoke</button></div>'
-            : '')
+        + '<div class="actions"><button class="quiet warn" onclick="revoke(\'' + esc(t.id) + '\',\'' + esc(t.name) + '\')">revoke</button></div>'
         + '</div>';
     }
     el.innerHTML = html;
@@ -173,7 +168,7 @@ function loadTokens() {
 }
 
 function revoke(id, name) {
-  if (!confirm("revoke token '" + name + "'? anything using it stops working.")) return;
+  if (!confirm("revoke token '" + name + "'? it is deleted and anything using it stops working.")) return;
   api("/dash/tokens/" + id + "/revoke", { method: "POST" });
   setTimeout(loadTokens, 400);
 }
@@ -225,7 +220,8 @@ document.getElementById("tokform").addEventListener("submit", function(ev) {
     if (res.ok) {
       box.innerHTML = '<div class="msg ok">token created. copy it now — it is shown once:</div>'
         + '<pre class="token">' + esc(res.body.token) + '</pre>'
-        + '<div class="msg body">use it: curl -u shipd:' + esc(res.body.token) + ' https://shipd.plainskill.net/api/apps</div>';
+        + '<div class="msg body">CLI: <code>shipd login ' + esc(res.body.token) + '</code></div>'
+        + '<div class="msg body">API: <code>curl -u shipd:' + esc(res.body.token) + ' https://shipd.plainskill.net/api/apps</code></div>';
       document.getElementById("tokname").value = "";
       loadTokens();
     } else {

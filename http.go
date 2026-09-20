@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -8,6 +9,21 @@ import (
 	"strconv"
 	"strings"
 )
+
+// gateOnly requires the Caddy-injected shared secret on the dashboard paths.
+// Those endpoints are unauthenticated by design — the authgate at Caddy
+// authenticates the human — so this header is what proves the request came
+// through Caddy and not from a sibling container on shipd-net (app
+// containers share that network and can reach the gateway IP directly).
+func (e *Engine) gateOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Shipd-Gate")), []byte(e.cfg.GateToken())) != 1 {
+			httpError(w, http.StatusForbidden, "direct access denied")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
 // guard enforces authentication: root token from config or a managed token.
 // Uses constant-time comparison via State.CheckToken.
@@ -31,7 +47,7 @@ func (e *Engine) guard(next http.Handler) http.Handler {
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "version": version})
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -82,23 +98,70 @@ func (e *Engine) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "invalid branch name")
 		return
 	}
-	if err := validSubdomain(req.Subdomain); err != nil {
-		httpError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if e.reserved(req.Subdomain) {
-		httpError(w, http.StatusBadRequest, "subdomain is reserved")
-		return
-	}
-	// one subdomain -> one app: reject if another repo already owns it
-	if owner := e.BySubdomain(req.Subdomain); owner != nil && owner.Key() != appKey(req.Repo, req.Branch) {
-		httpError(w, http.StatusConflict, "subdomain already used by "+owner.Repo+"@"+owner.Branch)
-		return
+	sub := strings.TrimSpace(req.Subdomain)
+	if sub != "" {
+		if err := validSubdomain(sub); err != nil {
+			httpError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if e.reserved(sub) {
+			httpError(w, http.StatusBadRequest, "subdomain is reserved")
+			return
+		}
+		// one subdomain -> one app: reject if another repo already owns it
+		if owner := e.BySubdomain(sub); owner != nil && owner.Key() != appKey(req.Repo, req.Branch) {
+			httpError(w, http.StatusConflict, "subdomain already used by "+owner.Repo+"@"+owner.Branch)
+			return
+		}
+	} else {
+		// no subdomain given: redeploy in place if this repo+branch already
+		// has a deployment, otherwise mint a random one
+		if existing := e.st.Get(appKey(req.Repo, req.Branch)); existing != nil && existing.Subdomain != "" {
+			sub = existing.Subdomain
+		} else {
+			rand, err := e.randomSubdomain()
+			if err != nil {
+				httpError(w, http.StatusInternalServerError, "could not allocate subdomain")
+				return
+			}
+			sub = rand
+		}
 	}
 
-	app := e.Upsert(req.Repo, req.Branch, req.Subdomain)
+	app := e.Upsert(req.Repo, req.Branch, sub)
 	go e.RunDeploy(app.Key())
 	writeJSON(w, http.StatusAccepted, map[string]any{"app": app, "message": "deployment queued"})
+}
+
+// handleDeleteByIdentity deletes the deployment for a repo+branch, which is
+// the app's identity — this is what `shipd delete` uses.
+func (e *Engine) handleDeleteByIdentity(w http.ResponseWriter, r *http.Request) {
+	var req deployRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	req.Repo = trimGitSuffix(req.Repo)
+	if !validRepoURL(req.Repo) {
+		httpError(w, http.StatusBadRequest, "repo must be an https:// or git@ git url")
+		return
+	}
+	if req.Branch == "" {
+		req.Branch = "main"
+	}
+	if !validBranch(req.Branch) {
+		httpError(w, http.StatusBadRequest, "invalid branch name")
+		return
+	}
+	key := appKey(req.Repo, req.Branch)
+	app := e.st.Get(key)
+	if app == nil {
+		httpError(w, http.StatusNotFound, "no deployment for "+req.Repo+"@"+req.Branch)
+		return
+	}
+	sub := app.Subdomain
+	go e.RunDelete(key)
+	writeJSON(w, http.StatusAccepted, map[string]string{"deleted": sub, "message": "deletion queued"})
 }
 
 func (e *Engine) handleAction(act action) http.HandlerFunc {
@@ -127,6 +190,30 @@ func (e *Engine) handleAction(act action) http.HandlerFunc {
 
 type createTokenRequest struct {
 	Name string `json:"name"`
+}
+
+// handleWhoami reports which token authenticated the request, so the CLI can
+// confirm a login and show a human-readable identity.
+func (e *Engine) handleWhoami(w http.ResponseWriter, r *http.Request) {
+	_, pass, ok := r.BasicAuth()
+	if !ok {
+		httpError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	valid, tokID := e.st.CheckToken(e.cfg.APIToken, pass)
+	if !valid {
+		httpError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	name := "root"
+	if tokID != "root" {
+		e.st.mu.RLock()
+		if t := e.st.Tokens[tokID]; t != nil {
+			name = t.Name
+		}
+		e.st.mu.RUnlock()
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"name": name, "id": tokID})
 }
 
 func (e *Engine) handleTokensList(w http.ResponseWriter, r *http.Request) {

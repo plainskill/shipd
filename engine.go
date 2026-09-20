@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -152,6 +153,22 @@ func (e *Engine) BySubdomain(sub string) *App {
 	return nil
 }
 
+// randomSubdomain mints an unused 12-hex-char subdomain (48 bits).
+func (e *Engine) randomSubdomain() (string, error) {
+	for i := 0; i < 8; i++ {
+		b := make([]byte, 6)
+		if _, err := rand.Read(b); err != nil {
+			return "", err
+		}
+		sub := hex.EncodeToString(b)
+		if e.reserved(sub) || e.BySubdomain(sub) != nil {
+			continue
+		}
+		return sub, nil
+	}
+	return "", fmt.Errorf("no free subdomain after 8 attempts")
+}
+
 func (e *Engine) reserved(sub string) bool {
 	for _, r := range e.cfg.Reserved {
 		if r == sub {
@@ -254,32 +271,56 @@ func (e *Engine) readDeck(src string) shipdJSON {
 func deckPaths(src string, deck shipdJSON) (ctxDir, dockerfile string) {
 	ctxDir = src
 	if deck.Context != "" {
-		ctxDir = filepath.Join(src, deck.Context)
+		if p, ok := safeJoin(src, deck.Context); ok {
+			ctxDir = p
+		} else {
+			log.Printf("shipd: rejecting shipd.json context %q (escapes repo)", deck.Context)
+		}
 	}
-	dockerfile = filepath.Join(src, orDefault(deck.Dockerfile, "Dockerfile"))
+	dockerfile = filepath.Join(src, "Dockerfile")
+	if deck.Dockerfile != "" {
+		if p, ok := safeJoin(src, deck.Dockerfile); ok {
+			dockerfile = p
+		} else {
+			log.Printf("shipd: rejecting shipd.json dockerfile %q (escapes repo)", deck.Dockerfile)
+		}
+	}
 	return ctxDir, dockerfile
 }
 
+// safeJoin joins rel onto base and reports whether the result stays inside
+// base (blocks "context": "../.." style escapes in a hostile shipd.json).
+func safeJoin(base, rel string) (string, bool) {
+	p := filepath.Clean(filepath.Join(base, rel))
+	base = filepath.Clean(base)
+	if p == base || strings.HasPrefix(p, base+string(os.PathSeparator)) {
+		return p, true
+	}
+	return "", false
+}
+
 // checkout clones (depth 1) or updates a repo working copy at dst.
+// Runs through runCmdEnv so git sees HOME=<data>/home — that is where deploy
+// keys (~/.ssh) and git config must live for git@ / private repos to work.
 // A failed clone removes dst so the next deploy starts clean (a partial
 // clone without .git would otherwise wedge the fetch path forever).
 func (e *Engine) checkout(repo, branch, dst string) (string, error) {
 	if _, err := os.Stat(filepath.Join(dst, ".git")); err != nil {
-		out, err := runCmd(5*time.Minute, "git", "clone", "--depth", "1", "--branch", branch,
+		out, err := e.runCmdEnv(5*time.Minute, "git", "clone", "--depth", "1", "--branch", branch,
 			"--single-branch", repo, dst)
 		if err != nil {
 			os.RemoveAll(dst)
 			return out, fmt.Errorf("clone %s@%s: %v: %s", repo, branch, err, tail(out, 200))
 		}
 	} else {
-		if out, err := runCmd(time.Minute, "git", "-C", dst, "fetch", "--depth", "1", "origin", branch); err != nil {
+		if out, err := e.runCmdEnv(time.Minute, "git", "-C", dst, "fetch", "--depth", "1", "origin", branch); err != nil {
 			return out, fmt.Errorf("fetch: %v: %s", err, tail(out, 200))
 		}
-		if out, err := runCmd(time.Minute, "git", "-C", dst, "reset", "--hard", "FETCH_HEAD"); err != nil {
+		if out, err := e.runCmdEnv(time.Minute, "git", "-C", dst, "reset", "--hard", "FETCH_HEAD"); err != nil {
 			return out, fmt.Errorf("checkout: %v: %s", err, tail(out, 200))
 		}
 	}
-	return runCmd(15*time.Second, "git", "-C", dst, "rev-parse", "HEAD")
+	return e.runCmdEnv(15*time.Second, "git", "-C", dst, "rev-parse", "HEAD")
 }
 
 // RunDeploy is the pipeline: checkout -> build -> probe temp (unrouted) ->
@@ -408,8 +449,10 @@ func (e *Engine) RunDeploy(key string) {
 		return
 	}
 	if !e.waitHealthy(current.containerName(), 15*time.Second) {
+		// container stays up (Traefik routes to it) but the deploy is
+		// reported failed — do NOT fall through and overwrite that
 		fail(fmt.Errorf("promoted container failed immediate probe; check logs"))
-		// keep it running — Traefik routes to it; operator can inspect
+		return
 	}
 	_, _ = e.runDocker(time.Minute, "rm", "-f", temp)
 
@@ -426,7 +469,7 @@ func (e *Engine) RunDeploy(key string) {
 // removeAppContainers removes every container labeled for this app key
 // except the one named in keep.
 func (e *Engine) removeAppContainers(key, keep string) {
-	out, _ := e.runDocker(30*time.Second, "ps", "-q", "--filter", "label=shipd.app="+key)
+	out, _ := e.runDocker(30*time.Second, "ps", "-aq", "--filter", "label=shipd.app="+key)
 	for _, id := range strings.Fields(out) {
 		if id != keep {
 			e.runDocker(30*time.Second, "rm", "-f", id)
@@ -545,6 +588,8 @@ func (e *Engine) RunStart(key string) {
 // runContainer starts the stable-named container for an app with the full
 // routing + env + port label set (used by deploy promotion and start).
 func (e *Engine) runContainer(app *App, image string, port int, env []string) error {
+	// a stopped/exited container still owns the name — clear it first
+	_, _ = e.runDocker(time.Minute, "rm", "-f", app.containerName())
 	runArgs := []string{
 		"run", "-d", "--name", app.containerName(),
 		"--network", shipdNetwork,
