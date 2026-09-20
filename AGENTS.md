@@ -53,8 +53,14 @@ is optional: empty means local-only images and no push attempt. `network` /
 proxy's upstream or a firewall rule depends on the gateway address (shipd warns
 at startup if an advertised `listen_extra` address is missing locally).
 
-Per-app environment set with `--env K=V` lives in shipd state (never the repo)
-and is exposed as `env_keys` only — values must never be returned by the API.
+Per-app environment lives in shipd state (never the repo) and is exposed as
+`env_keys` only — values must never be returned by the API. Sources, in
+increasing precedence: `shipd.json` `env` (public, read server-side), the
+`.shipd.env` file the CLI reads from the working tree (`--env-path` overrides it;
+`--env-unset K` removes a key), then `--env K=V`.
+
+An empty value means an empty value, and `env_unset` removes keys — do not
+conflate "unset" with "empty", a dotenv file uses `K=` for the latter.
 
 ## Testing
 

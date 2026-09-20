@@ -150,7 +150,8 @@ usage:
         one) and the token, verifies it, and stores both in
         ~/.config/shipd/config.json
 
-  shipd deploy [subdomain] [--branch <b>] [--repo <url>] [--env K=V ...]
+  shipd deploy [subdomain] [--branch <b>] [--repo <url>]
+                [--env K=V ...] [--env-unset K ...] [--env-path <file>]
         deploy the repo in the current directory. with no subdomain:
         redeploys in place if this repo+branch already exists, otherwise
         picks a random subdomain (printed in the response).
@@ -426,8 +427,9 @@ func cmdWhoami() {
 }
 
 func cmdDeploy(args []string) {
-	var subdomain, branch, repo string
-	var env map[string]string
+	var subdomain, branch, repo, envPath string
+	envFlags := map[string]string{}
+	var unset []string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--env", "-e":
@@ -439,10 +441,22 @@ func cmdDeploy(args []string) {
 			if !ok || k == "" {
 				die("--env needs KEY=value (got %q)", args[i])
 			}
-			if env == nil {
-				env = map[string]string{}
+			envFlags[k] = v
+		case "--env-unset":
+			if i+1 >= len(args) {
+				die("--env-unset needs KEY")
 			}
-			env[k] = v
+			i++
+			if !validEnvKey(args[i]) {
+				die("--env-unset needs a valid variable name (got %q)", args[i])
+			}
+			unset = append(unset, args[i])
+		case "--env-path":
+			if i+1 >= len(args) {
+				die("--env-path needs a file")
+			}
+			i++
+			envPath = args[i]
 		case "--branch", "-b":
 			if i+1 >= len(args) {
 				die("--branch needs a value")
@@ -480,19 +494,49 @@ func cmdDeploy(args []string) {
 		}
 	}
 
+	// environment: shipd.json env (public, read server-side) is the base; the
+	// env file overrides it; explicit --env flags override the file.
+	cwd, _ := os.Getwd()
+	fileEnv, label, warns := loadEnvFile(envPath, cwd)
+	for _, w := range warns {
+		fmt.Fprintln(os.Stderr, w)
+	}
+	env := map[string]string{}
+	for k, v := range fileEnv {
+		env[k] = v
+	}
+	for k, v := range envFlags {
+		env[k] = v
+	}
+
 	payload := map[string]any{"repo": repo, "branch": branch, "subdomain": subdomain}
 	if len(env) > 0 {
 		payload["env"] = env
+	}
+	if len(unset) > 0 {
+		payload["env_unset"] = unset
+	}
+	if len(env) > 0 || len(unset) > 0 {
 		keys := make([]string, 0, len(env))
-		for k, v := range env {
-			if v == "" {
-				keys = append(keys, k+" (cleared)")
-			} else {
-				keys = append(keys, k)
-			}
+		for k := range env {
+			keys = append(keys, k)
 		}
 		sort.Strings(keys)
-		fmt.Printf("env: %s\n", strings.Join(keys, ", "))
+		var sources []string
+		if len(fileEnv) > 0 {
+			sources = append(sources, fmt.Sprintf("%d from %s", len(fileEnv), filepath.Base(label)))
+		}
+		if len(envFlags) > 0 {
+			sources = append(sources, fmt.Sprintf("%d from --env", len(envFlags)))
+		}
+		if len(unset) > 0 {
+			sources = append(sources, fmt.Sprintf("%d unset", len(unset)))
+		}
+		if len(keys) > 0 {
+			fmt.Printf("env: %s (%s)\n", strings.Join(keys, ", "), strings.Join(sources, ", "))
+		} else {
+			fmt.Printf("env: %s\n", strings.Join(sources, ", "))
+		}
 	}
 	code, body, err := api("POST", "/api/deploy", payload)
 	if err != nil {

@@ -105,11 +105,38 @@ prune` reports orphaned data directories but never deletes them.
 
 ### Secrets
 
-Environment set with `shipd deploy --env KEY=value` (repeatable) is stored in
-shipd's state file (0600) — **not** in the repo — and layered over anything
-declared in `shipd.json`. `--env KEY=` removes a key. Values are applied to the
-container and re-applied on `start`, and are never returned by the API: the
-listing exposes key names only, so a leaked listing cannot hand over a secret.
+Environment for an app comes from three places, later overriding earlier:
+
+1. **`shipd.json` `env`** — *public* values that belong in the repo.
+2. **`.shipd.env`** (repo root) — a dotenv file, read from your working tree by
+   `shipd deploy`. Silently skipped when absent, which is the normal case.
+3. **`shipd deploy --env K=V`** — explicit, per-invocation.
+
+```sh
+shipd deploy                       # reads ./.shipd.env if it exists
+shipd deploy --env-path prod.env   # use this file instead (warns if missing)
+shipd deploy --env K=V             # override a single value from the file
+shipd deploy --env-unset K         # remove a stored variable
+```
+
+`--env-path` replaces `.shipd.env` entirely rather than merging with it.
+
+File format is dotenv: `KEY=VALUE` per line, `#` comments, blank lines ignored,
+an optional `export ` prefix, and single/double quotes. Inline ` # comment` is
+stripped from unquoted values. A malformed line is reported and skipped — one
+typo never blocks a deploy. `KEY=` sets an empty value; use `--env-unset` to
+remove a key.
+
+Values are stored in shipd's state (0600) — **never in the repo** — applied to
+the container, and re-applied on `start`. They persist, so a redeploy from the
+dashboard (which has no access to your working tree) keeps them. The API exposes
+`env_keys` only: values are never returned.
+
+> **If your env file is tracked by git**, `shipd deploy` says so:
+> `warn: .shipd.env is tracked by git — secrets will ship in the deploy`
+> A tracked file is cloned server-side on every deploy and lives in the repo
+> history. Prefer adding `.shipd.env` to `.gitignore`; `shipd.json` is for the
+> public values that are meant to be committed.
 
 ### What does not fit
 

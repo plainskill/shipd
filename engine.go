@@ -227,9 +227,11 @@ func (e *Engine) EnsureNetwork() error {
 
 // Reconcile aligns status with reality (e.g. after a host reboot) and cleans
 // up temp containers orphaned by a restart mid-deploy.
-// setEnv merges deploy-time environment into an app. An empty value deletes
-// the key. Values live in shipd's state (0600), never in the repo.
-func (e *Engine) setEnv(key string, env map[string]string) *App {
+// setEnv merges deploy-time environment into an app and removes any keys named
+// in unset. An empty value is stored as an empty value (a dotenv file's
+// KEY= means exactly that); use unset to remove a key. Values live in shipd's
+// state (0600), never in the repo.
+func (e *Engine) setEnv(key string, env map[string]string, unset []string) *App {
 	e.st.mu.Lock()
 	a := e.st.Apps[key]
 	if a == nil {
@@ -240,11 +242,10 @@ func (e *Engine) setEnv(key string, env map[string]string) *App {
 		a.Env = map[string]string{}
 	}
 	for k, v := range env {
-		if v == "" {
-			delete(a.Env, k)
-			continue
-		}
 		a.Env[k] = v
+	}
+	for _, k := range unset {
+		delete(a.Env, k)
 	}
 	e.st.mu.Unlock()
 	e.st.Save()

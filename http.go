@@ -117,8 +117,12 @@ type deployRequest struct {
 	Branch    string `json:"branch"`
 	Subdomain string `json:"subdomain"`
 	// Env is per-app environment stored in shipd's state (never in the repo),
-	// so secrets stay out of git. An empty value removes the key.
+	// so secrets stay out of git. An empty string is an empty value;
+	// env_unset removes keys.
 	Env map[string]string `json:"env,omitempty"`
+
+	// EnvUnset removes variables from the stored environment.
+	EnvUnset []string `json:"env_unset,omitempty"`
 }
 
 func (e *Engine) handleDeploy(w http.ResponseWriter, r *http.Request) {
@@ -170,8 +174,8 @@ func (e *Engine) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	app := e.Upsert(req.Repo, req.Branch, sub)
-	if len(req.Env) > 0 {
-		app = e.setEnv(app.Key(), req.Env)
+	if len(req.Env) > 0 || len(req.EnvUnset) > 0 {
+		app = e.setEnv(app.Key(), req.Env, req.EnvUnset)
 	}
 	go e.RunDeploy(app.Key())
 	writeJSON(w, http.StatusAccepted, map[string]any{"app": app, "message": "deployment queued"})
