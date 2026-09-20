@@ -78,7 +78,7 @@
     <hr class="divider">
     <div class="meta">single-user deploy plane &middot;
       <a href="/healthz">health</a> &middot;
-      <a href="https://gt.plainskill.net/plainskill/shipd">source</a>
+      <a id="source" href="#" style="display:none">source</a>
     </div>
   </footer>
 </div>
@@ -102,6 +102,11 @@ function loadApps() {
   // zone from the server, never hardcoded
 api("/dash/config").then(function(r) { return r.ok ? r.json() : null; }).then(function(c) {
   if (c && c.domain) document.getElementById("zone").textContent = c.domain;
+  if (c && c.source_url) {
+    var s = document.getElementById("source");
+    s.href = c.source_url;
+    s.style.display = "";
+  }
 }).catch(function() {});
 
 api("/dash/apps").then(function(r) {

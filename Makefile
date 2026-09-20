@@ -1,10 +1,11 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-REGISTRY ?= localhost:5000
-IMAGE ?= $(REGISTRY)/atlas/shipd
+# IMAGE is just the local tag; push it wherever your deployment's registry is
+# (the update pipeline lives with that deployment's ops files, not in the repo)
+IMAGE ?= shipd
 GO ?= go
 DIST ?= dist
 
-.PHONY: help vet test check-dash build cli image push deploy dist release clean
+.PHONY: help vet test check-dash build cli image push dist clean
 
 help:
 	@grep -E '^[a-z-]+:.*?##' $(MAKEFILE_LIST) | sed 's/:.*##/\t/' | column -t -s "$$(printf '\t')"
@@ -43,9 +44,6 @@ image: ## build the artifact image (server binary) locally
 push: image ## build + push the artifact image to the local registry
 	docker push $(IMAGE):$(VERSION)
 	docker push $(IMAGE):latest
-
-deploy: ## build on pscA, push to the registry, update the running service
-	./deploy.sh
 
 clean:
 	rm -rf $(DIST)

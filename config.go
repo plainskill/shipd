@@ -15,21 +15,42 @@ import (
 type Config struct {
 	Listen string `json:"listen"` // primary listen address
 
-	// ListenExtra are additional listen addresses. Used to expose the API on
-	// a docker bridge gateway IP (e.g. 172.16.0.1:8900, the shipd-net
-	// gateway) so a containerized reverse proxy (Caddy) can reach the host
-	// process. Never exposed publicly (UFW default-deny covers non-loopback),
-	// BUT every app container on shipd-net can also reach this address — so
-	// the dashboard paths require the Caddy-injected X-Shipd-Gate header.
+	// ListenExtra are additional listen addresses. Used to expose the API on a
+	// docker bridge gateway IP so a containerized reverse proxy (the edge
+	// proxy) can reach the host process. Not publicly exposed, BUT every app
+	// container on the app network can reach this address too — which is why
+	// the dashboard paths require the edge-injected X-Shipd-Gate header.
 	ListenExtra []string `json:"listen_extra"`
 
-	// Domain is the app zone (default is this deployment's; set it explicitly
-	// on any other host).
+	// Domain is the app zone (required): apps are served at
+	// <subdomain>.<domain>. There is deliberately no default — a wrong
+	// default would silently publish into someone else's zone.
 	Domain string `json:"domain"`
 
-	// Registry is where built images are tagged/pushed. The push is
-	// best-effort; an unreachable registry degrades to local-only images.
+	// Registry is the optional image registry, e.g. "registry.example:5000".
+	// Empty means local-only images and no push attempt (a deployment without
+	// a registry should not log push failures).
 	Registry string `json:"registry"`
+
+	// Network is the docker network app containers join (default "shipd-net").
+	Network string `json:"network"`
+
+	// NetworkSubnet, when set, is used if the network has to be created
+	// (e.g. "172.16.0.0/24"). Pin it when something else — a reverse proxy, a
+	// firewall rule — depends on the network's gateway address.
+	NetworkSubnet string `json:"network_subnet"`
+
+	// SourceURL is an optional link shown in the dashboard (e.g. this
+	// deployment's forge page). Omitted from the UI when empty.
+	SourceURL string `json:"source_url"`
+
+	// EdgeProbe is an optional URL template shipd polls after promoting a
+	// container, so a deploy is only reported successful once the app is
+	// reachable *through the edge*. "{domain}" is replaced with the app's
+	// domain, e.g. "https://{domain}/". Empty disables the check. It closes
+	// the window where the container is healthy but the edge has not yet
+	// discovered its router (a 404 from the proxy for a few seconds).
+	EdgeProbe string `json:"edge_probe"`
 
 	APIToken string `json:"api_token"`
 	DataDir  string `json:"data_dir"`
@@ -51,19 +72,20 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.Listen = ":8080"
 	}
 	if cfg.Domain == "" {
-		cfg.Domain = "apps.plainskill.net"
+		return nil, fmt.Errorf("domain is required in %s (apps are served at <subdomain>.<domain>)", path)
 	}
 	if cfg.DataDir == "" {
 		cfg.DataDir = "/data"
 	}
-	if cfg.Registry == "" {
-		cfg.Registry = "localhost:5000"
+	if cfg.Network == "" {
+		cfg.Network = "shipd-net"
 	}
 	if cfg.APIToken == "" {
 		return nil, fmt.Errorf("api_token is required in %s", path)
 	}
 	if len(cfg.Reserved) == 0 {
-		cfg.Reserved = []string{"shipd", "api", "check", "healthz", "dashboard", "proxy", "caddy", "forgejo", "git", "mail", "smtp", "ns1", "ns2", "vpn", "status"}
+		// generic, deployment-agnostic defaults; add your own names explicitly
+		cfg.Reserved = []string{"shipd", "api", "check", "healthz", "dashboard", "www", "proxy", "gate", "login", "admin"}
 	}
 	return cfg, nil
 }
@@ -92,10 +114,10 @@ func (c *Config) AppDataDir(key string) string {
 	return filepath.Join(c.AppsDir(), hashKey(key))
 }
 
-// AskBase is the address a reverse proxy should use to reach shipd for the
+// AskBase is the address an edge proxy should use to reach shipd for the
 // on-demand TLS ask endpoint. It prefers an explicit listen_extra address
-// (the docker bridge gateway in this deployment) and falls back to the
-// primary listen address.
+// (typically the app network's gateway) and falls back to the primary listen
+// address.
 func (c *Config) AskBase() string {
 	if len(c.ListenExtra) > 0 {
 		return c.ListenExtra[0]
@@ -103,17 +125,18 @@ func (c *Config) AskBase() string {
 	return c.Listen
 }
 
-// AskToken derives the static token Caddy presents to /check. Derived from
+// AskToken derives the static token the edge proxy presents to /check. Derived from
 // the API token so there is exactly one secret to manage.
 func (c *Config) AskToken() string {
 	h := sha256.Sum256([]byte("shipd-ask:" + c.APIToken))
 	return hex.EncodeToString(h[:16])
 }
 
-// GateToken derives the shared secret Caddy injects as X-Shipd-Gate on the
-// dashboard paths. /dash/* is unauthenticated by design (the authgate at
-// Caddy authenticates users), so this header is what distinguishes a request
-// that came through Caddy from one issued by a sibling container on shipd-net.
+// GateToken derives the shared secret the edge proxy injects as X-Shipd-Gate
+// on the dashboard paths. /dash/* is unauthenticated by design (the
+// authenticating edge authenticates humans), so this header is what
+// distinguishes a request that came through the edge from one issued by a
+// sibling app container on the app network.
 func (c *Config) GateToken() string {
 	h := sha256.Sum256([]byte("shipd-gate:" + c.APIToken))
 	return hex.EncodeToString(h[:16])

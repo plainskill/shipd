@@ -1,113 +1,85 @@
-# AGENTS.md — working with shipd
+# AGENTS.md — operating shipd
 
-shipd is the homelab deploy plane ("Vercel but cheaper"): git repo in, container
-at `<subdomain>.apps.plainskill.net` out. This file is for agents operating it.
+Guidance for agents working **on** shipd (the code in this repo).
 
-## Fast paths
+shipd is deployment-agnostic: nothing here assumes a particular host, domain, or
+edge proxy. The running instance's specifics — host layout, gate services,
+paths, the update pipeline — live with that deployment's ops files, not in this
+repo.
 
-```sh
-# deploy the repo you're in (keeps its subdomain, or mints a random one)
-shipd deploy
-shipd deploy excalidraw          # explicit subdomain
-shipd delete                     # remove this repo's deployment
-shipd apps                       # what's deployed
-shipd logs [subdomain]           # container logs
-shipd whoami                     # which server + token am I using
-```
+## What shipd does
 
-CLI config lives in `~/.config/shipd/config.json` (server + token, 0600).
-`SHIPD_SERVER` / `SHIPD_TOKEN` override it. There is no default server — shipd
-is host-agnostic; `shipd login` asks for it.
+Point it at a git repo + branch and it builds and runs a container at
+`<subdomain>.<domain>`, with TLS handled by whatever edge proxy sits in front.
+App identity is **(repo, branch)**; the subdomain is an attribute.
 
-Raw API (tokens are for programmatic use):
+## Deploy semantics (do not simplify these)
 
-```sh
-curl -u shipd:$TOKEN https://<host>/api/apps
-curl -u shipd:$TOKEN -H 'Content-Type: application/json' \
-  -d '{"repo":"https://gt.plainskill.net/plainskill/x.git","branch":"main","subdomain":"x"}' \
-  https://<host>/api/deploy
-curl -u shipd:$TOKEN -H 'Content-Type: application/json' \
-  -d '{"repo":"https://gt.plainskill.net/plainskill/x.git","branch":"main"}' \
-  https://<host>/api/delete          # delete by identity
-curl -u shipd:$TOKEN -X POST https://<host>/api/prune    # reclaim builds/images
-```
+Pipeline: clone → build → run a temp container **without routing labels** →
+HTTP-probe it by container IP → promote.
 
-## Auth model — do not confuse the two gates
+- A failed probe discards the temp container and the previous version keeps
+  serving (rollback). Never give the temp container router labels — unvalidated
+  code would take live traffic.
+- Promotion re-checks state first: a delete or stop that lands mid-build wins,
+  and the build is discarded.
+- `removeAppContainers(key, keep)` resolves container IDs to names before
+  comparing `keep` (`docker ps` returns IDs). It cleans up exited orphans too
+  (`ps -aq`), which is what makes subdomain reassignment safe.
 
-- **authgate** = `forward_auth plainskill-dash:4181 { uri /verify }` — the real
-  authentication for humans. Gates the dashboard and other hosts.
-- **abm** = `forward_auth abm:4191 { uri /check }` — **anti-bot only, NOT
-  auth.** It belongs on *every* host, including deployed apps and the port-80
-  catch-all. Never describe abm as authentication, and never "fix" an auth
-  problem by adding abm.
-- **API tokens** = programmatic only (`curl`, CI, CLI). Unscoped: any valid
-  token == root.
+## Auth model
+
+Three distinct things — do not conflate them:
+
+| layer | role |
+|---|---|
+| **edge authentication** (an authenticating forward proxy in front) | authenticates humans. shipd trusts the edge for the dashboard |
+| **anti-bot** (a bot-filtering forward proxy, if deployed) | **not** authentication. Applies to every host, including deployed apps |
+| **API tokens** | programmatic access only (curl / CI / CLI). Unscoped: any valid token == root |
 
 `/dash/*` and the dashboard page are unauthenticated at the shipd layer *by
-design* (authgate does the human auth) but require the `X-Shipd-Gate` header
-that Caddy injects — that is what stops a deployed app container on `shipd-net`
-from reaching the control plane via `172.16.0.1:8900`.
+design* — the edge authenticates. Because app containers share the app network
+and can reach the gateway listener directly, those paths require the
+`X-Shipd-Gate` header that only the edge knows (derived from the API token). Any
+new route on the gateway listener must either be safe to expose to app
+containers or be gated the same way.
 
-## Deploy semantics
+## Configuration
 
-App identity is **(repo, branch)**; subdomain is an attribute.
+`domain` and `api_token` are **required** — there is no default domain, so a
+misconfigured deploy cannot silently publish into someone else's zone. `registry`
+is optional: empty means local-only images and no push attempt. `network` /
+`network_subnet` control the app network; pinning the subnet matters when a
+proxy's upstream or a firewall rule depends on the gateway address (shipd warns
+at startup if an advertised `listen_extra` address is missing locally).
 
-- subdomain given → deploy there; 409 if another repo+branch owns it
-- subdomain omitted + app exists → redeploy in place, same subdomain
-- subdomain omitted + no app → random 12-hex subdomain, returned in response
+Per-app environment set with `--env K=V` lives in shipd state (never the repo)
+and is exposed as `env_keys` only — values must never be returned by the API.
 
-Per-app env set with `--env K=V` lives in state (never the repo) and is masked
-as `env_keys` in API responses. Apps get `<data>`→`/data` bind-mounted, so
-redeploys keep SQLite state; data outlives `delete` and is never auto-removed.
+## Testing
 
-Pipeline: clone → build → run temp **without routing labels** → HTTP probe by
-container IP → promote (remove old, run stable with labels). A failed probe
-rolls back and the old version keeps serving. Do not "simplify" this by giving
-the temp container router labels — unvalidated code would take live traffic.
-
-## Operating the server (pscA)
-
-| thing | where |
-|---|---|
-| binary | `/usr/local/bin/shipd` |
-| config | `/etc/shipd/config.json` (0640 root:plainskill) |
-| state | `/data/shipd/state.json` (apps + tokens + per-app env) |
-| app data | `/data/shipd/apps/<app-key-hash>` → `/data` in each container (mode 0775 + `--group-add 1000`, so a non-root image USER can write); `by-name/<sub>` symlinks. `shipd prune` never deletes these. Setgid is impossible: the unit sets `RestrictSUIDSGID=true` |
-| builds | `/data/shipd/builds/` |
-| git HOME | `/data/shipd/home` (deploy keys in `.ssh/` here) |
-| unit | `systemctl {status,restart} shipd`, `journalctl -u shipd` |
-| update | `sudo /stack/compose/shipd/update.sh` (registry → binary swap + rollback). **Trust:** it runs the pulled binary as root, weekly and unattended against `:latest` — registry push access ≈ root on pscA |
-| app network | `shipd-net` must keep its fixed subnet 172.16.0.0/24 (gateway 172.16.0.1). Recreating it without `--subnet/--gateway` breaks `listen_extra`, the UFW rule and the ask URL; shipd logs a warning at startup if the address is missing |
-| routing | `/stack/compose/shipd-routing/` (Traefik `shipd-router`) |
-| caddy | `/stack/compose/caddy/Caddyfile` |
-
-Deploy/update shipd itself from the repo checkout on pscB:
-
-```sh
-make deploy            # build on pscA, push to localhost:5000, update, verify
-make dist              # release binaries + SHA256SUMS
-```
+`make vet` runs `go vet`, the Go test suite, a JS syntax check of the embedded
+dashboard script, and `dash.test.js` (which executes the real embedded script
+against a stub DOM and asserts the rendered markup). Anything touching the
+dashboard must keep that passing — a JS syntax error in the embedded script
+disables the entire page silently.
 
 ## Pitfalls
 
-- **Caddyfile edits**: it is a single-file bind mount. Edit **in place**
-  (`open(path,'w')` after read / truncate) — `sed -i` creates a new inode and
-  the container keeps serving the stale file. Verify with
-  `docker exec caddy md5sum /etc/caddy/Caddyfile` before trusting a reload.
-- **abm coverage**: `sudo python3 /stack/compose/caddy/audit-abm.py` lists every
-  site block and flags missing abm. `abm.plainskill.net` is the one intentional
-  exception (the verify portal must not gate itself).
-- **Container-reachable control plane**: any app container can reach
-  `172.16.0.1:8900`. Only `/check` and `/healthz` are safe there; `/dash/*`
-  requires the gate header. Never add an unguarded route to the gateway
-  listener.
-- **Hostnames**: Forgejo is `gt.plainskill.net` (not `git.`). Apps live under
-  `apps.plainskill.net`. The apex wildcard is `*.plainskill.net`.
-- **Registry image has no shell** (scratch): use `docker create` + `docker cp`
-  to extract the binary, not `docker run`.
-- **`docker create` needs a CMD** — the Dockerfile carries `CMD ["/shipd"]`
-  for exactly this reason.
-- **git needs HOME**: git runs with `HOME=/data/shipd/home`; `ProtectHome=tmpfs`
-  in the unit means the real home is unusable.
-- **Deleting a subdomain's app** while a deploy is in flight is safe — the
-  deploy re-checks state before promoting and discards the build.
+- **Caddyfile-style config files**: a single-file bind mount edited with a
+  rewrite (e.g. `sed -i`) changes the inode and the container keeps reading the
+  old file. Edit in place, or restart the container.
+- **`docker create` needs a CMD** — the artifact image carries `CMD ["/shipd"]`
+  for exactly this reason. The image has no shell either: extract the binary
+  with `docker create` + `docker cp`, never `docker run`.
+- **shipd runs unprivileged** and cannot chown to another uid, nor set setgid
+  when the unit sets `RestrictSUIDSGID`. Per-app `/data` is made usable with
+  group ownership + `--group-add`, not chown.
+- **git needs a HOME**: `ProtectHome=tmpfs` in a hardened unit means git must be
+  invoked with an explicit writable `HOME` (shipd uses `<data_dir>/home`).
+- **Deploys ship the remote, not the working tree** — the clone is what makes
+  deploys reproducible. `shipd deploy` with no origin prints the remedy.
+- **Non-HTTP apps** fail the probe by design; they need an HTTP shim.
+- **Edge discovery latency**: right after promotion the app container is healthy
+  but the proxy may 404 until it reloads its routes. Set `edge_probe` so a deploy
+  is only reported successful once the app answers through the edge.

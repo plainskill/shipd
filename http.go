@@ -240,8 +240,9 @@ type createTokenRequest struct {
 // can render it instead of hardcoding a hostname.
 func (e *Engine) handleConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
-		"domain":  e.cfg.Domain,
-		"version": version,
+		"domain":     e.cfg.Domain,
+		"version":    version,
+		"source_url": e.cfg.SourceURL,
 	})
 }
 

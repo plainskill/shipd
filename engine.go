@@ -21,11 +21,10 @@ import (
 )
 
 const (
-	logTimeout     = 30 * time.Second
-	healthTimeout  = 45 * time.Second
-	healthInterval = 2 * time.Second
-
-	shipdNetwork = "shipd-net"
+	logTimeout       = 30 * time.Second
+	healthTimeout    = 45 * time.Second
+	healthInterval   = 2 * time.Second
+	edgeProbeTimeout = 40 * time.Second
 )
 
 // Engine executes deploys and docker/git operations against the host.
@@ -133,7 +132,11 @@ func (e *Engine) Upsert(repo, branch, subdomain string) *App {
 	a.Subdomain = subdomain
 	a.Domain = subdomain + "." + e.cfg.Domain
 	// hashKey disambiguates slug-folded repos (https://x/a-b vs https://x/a/b)
-	a.Image = fmt.Sprintf("%s/shipd/%s-%s:%s", e.cfg.Registry, slug(repo), hashKey(key), slug(branch))
+	base := "shipd/" + slug(repo) + "-" + hashKey(key) + ":" + slug(branch)
+	if e.cfg.Registry != "" {
+		base = e.cfg.Registry + "/" + base
+	}
+	a.Image = base
 	a.Status = StatusQueued
 	a.DesiredUp = true
 	a.LastDeploy = now
@@ -198,19 +201,27 @@ func (e *Engine) DomainAllowed(domain string) bool {
 
 // EnsureNetwork creates the shipd-net docker network if missing.
 func (e *Engine) EnsureNetwork() error {
+	name := e.cfg.Network
 	out, err := e.runDocker(30*time.Second, "network", "ls", "--format", "{{.Name}}")
 	if err != nil {
 		return fmt.Errorf("network ls: %v: %s", err, out)
 	}
 	for _, n := range strings.Fields(out) {
-		if n == shipdNetwork {
+		if n == name {
 			return nil
 		}
 	}
-	if out, err := e.runDocker(time.Minute, "network", "create", shipdNetwork); err != nil {
+	args := []string{"network", "create"}
+	if e.cfg.NetworkSubnet != "" {
+		// pin the subnet: anything depending on the gateway address (a proxy's
+		// upstream, a firewall rule) breaks if docker picks a random one
+		args = append(args, "--subnet", e.cfg.NetworkSubnet)
+	}
+	args = append(args, name)
+	if out, err := e.runDocker(time.Minute, args...); err != nil {
 		return fmt.Errorf("network create: %v: %s", err, out)
 	}
-	log.Printf("shipd: created network %s", shipdNetwork)
+	log.Printf("shipd: created network %s (subnet %q)", name, e.cfg.NetworkSubnet)
 	return nil
 }
 
@@ -283,7 +294,10 @@ func (e *Engine) Prune() PruneResult {
 	}
 
 	// images: only <registry>/shipd/* tags
-	prefix := e.cfg.Registry + "/shipd/"
+	prefix := "shipd/"
+	if e.cfg.Registry != "" {
+		prefix = e.cfg.Registry + "/shipd/"
+	}
 	out, _ := e.runDocker(time.Minute, "images", "--format", "{{.Repository}}:{{.Tag}}")
 	for _, img := range strings.Fields(out) {
 		if !strings.HasPrefix(img, prefix) || strings.Contains(img, "<none>") {
@@ -510,9 +524,12 @@ func (e *Engine) RunDeploy(key string) {
 		return
 	}
 
-	// 4. push (best-effort; the local image is what actually runs)
-	if out, err := e.runDocker(5*time.Minute, "push", image); err != nil {
-		log.Printf("shipd: push %s failed (continuing with local image): %v: %s", image, err, tail(out, 200))
+	// 4. push (best-effort; the local image is what actually runs). Skipped
+	// entirely when no registry is configured.
+	if e.cfg.Registry != "" {
+		if out, err := e.runDocker(5*time.Minute, "push", image); err != nil {
+			log.Printf("shipd: push %s failed (continuing with local image): %v: %s", image, err, tail(out, 200))
+		}
 	}
 
 	// 5. run new version under a temp name WITHOUT router labels — it must
@@ -521,7 +538,7 @@ func (e *Engine) RunDeploy(key string) {
 	_, _ = e.runDocker(time.Minute, "rm", "-f", temp) // stale same-sha container
 	runArgs := []string{
 		"run", "-d", "--name", temp,
-		"--network", shipdNetwork,
+		"--network", e.cfg.Network,
 		"--restart", "unless-stopped",
 		"--label", "shipd.app=" + key,
 		"--label", "shipd.subdomain=" + app.Subdomain,
@@ -581,6 +598,12 @@ func (e *Engine) RunDeploy(key string) {
 	}
 	_, _ = e.runDocker(time.Minute, "rm", "-f", temp)
 
+	if err := e.waitEdgeRouted(current, edgeProbeTimeout); err != nil {
+		// the container is healthy; a slow or misconfigured edge should be
+		// loud, not a silent "deployed"
+		log.Printf("shipd: WARNING: %v", err)
+	}
+
 	e.st.Update(key, func(a *App) {
 		a.Status = StatusRunning
 		a.Port = port
@@ -623,6 +646,37 @@ func (e *Engine) linkAppDataName(app *App) error {
 		return fmt.Errorf("link app data %s: %w", app.Subdomain, err)
 	}
 	return nil
+}
+
+// waitEdgeRouted polls the configured edge URL until the app answers through
+// it, so "deployed" means reachable and not merely "container running". Any
+// response other than 404 counts as routed (the proxy returns 404 when no
+// router matches the host). Disabled when edge_probe is unset.
+func (e *Engine) waitEdgeRouted(app *App, timeout time.Duration) error {
+	if e.cfg.EdgeProbe == "" {
+		return nil
+	}
+	target := strings.ReplaceAll(e.cfg.EdgeProbe, "{domain}", app.Domain)
+	deadline := time.Now().Add(timeout)
+	var last string
+	for time.Now().Before(deadline) {
+		req, err := http.NewRequest(http.MethodGet, target, nil)
+		if err != nil {
+			return fmt.Errorf("edge_probe url %q: %w", target, err)
+		}
+		resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+		if err != nil {
+			last = err.Error()
+		} else {
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusNotFound {
+				return nil
+			}
+			last = "HTTP 404 (no router matched yet)"
+		}
+		time.Sleep(700 * time.Millisecond)
+	}
+	return fmt.Errorf("edge did not route %s within %s (last: %s) — container is up, check the proxy", target, timeout, last)
 }
 
 // containerName resolves a container ID to its name, without the leading slash.
@@ -795,7 +849,7 @@ func (e *Engine) runContainer(app *App, image string, port int, env []string) er
 	env = mergeEnv(env, app.Env)
 	runArgs := []string{
 		"run", "-d", "--name", app.containerName(),
-		"--network", shipdNetwork,
+		"--network", e.cfg.Network,
 		"--volume", dataDir + ":/data",
 		"--group-add", dataGID,
 		"--restart", "unless-stopped",
@@ -803,7 +857,7 @@ func (e *Engine) runContainer(app *App, image string, port int, env []string) er
 		"--label", "shipd.subdomain=" + app.Subdomain,
 		"--label", "shipd.port=" + fmt.Sprint(port),
 		"--label", "traefik.enable=true",
-		"--label", "traefik.docker.network=" + shipdNetwork,
+		"--label", "traefik.docker.network=" + e.cfg.Network,
 		"--label", "traefik.http.routers.app-" + app.Subdomain + ".rule=Host(`" + app.Domain + "`)",
 		"--label", "traefik.http.routers.app-" + app.Subdomain + ".entrypoints=web",
 		"--label", "traefik.http.services.app-" + app.Subdomain + ".loadbalancer.server.port=" + fmt.Sprint(port),
