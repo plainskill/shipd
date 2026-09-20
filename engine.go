@@ -629,6 +629,31 @@ func (e *Engine) removeAppContainers(key, keep string) {
 	}
 }
 
+// prepareAppData creates and prepares the app's persistent /data directory and
+// returns it along with the gid the container must be added to.
+//
+// shipd runs unprivileged (and its unit sets RestrictSUIDSGID), so it cannot
+// chown the dir to the image's user, nor set the setgid bit. Group-writability
+// plus --group-add is what makes /data usable: whoever the image runs as joins
+// shipd's group and can write. Files the container creates keep the container's
+// own uid, so host-side management is via the directory (shipd owns it) rather
+// than individual file ownership.
+func (e *Engine) prepareAppData(app *App) (dataDir, gid string, err error) {
+	dataDir = e.cfg.AppDataDir(app.Key())
+	if err := os.MkdirAll(dataDir, 0o775); err != nil {
+		return "", "", fmt.Errorf("create app data dir: %w", err)
+	}
+	if err := os.Chmod(dataDir, 0o775); err != nil {
+		log.Printf("shipd: chmod app data dir: %v", err)
+	}
+	// maintain the human-discoverable by-name link (regression: this call was
+	// once dropped by an edit, leaving the helper defined but never called)
+	if err := e.linkAppDataName(app); err != nil {
+		log.Printf("shipd: %v", err)
+	}
+	return dataDir, strconv.Itoa(os.Getgid()), nil
+}
+
 // linkAppDataName maintains <apps>/by-name/<subdomain> -> <apps>/<hash> so the
 // data dir is findable by name while the storage stays keyed by app identity
 // (which survives subdomain changes).
@@ -832,20 +857,10 @@ func (e *Engine) runContainer(app *App, image string, port int, env []string) er
 	// It must be writable by the user the image actually runs as, or the
 	// volume is decoration: a container running as uid 10007 cannot write to
 	// a dir owned by the host user.
-	dataDir := e.cfg.AppDataDir(app.Key())
-	if err := os.MkdirAll(dataDir, 0o775); err != nil {
-		return fmt.Errorf("create app data dir: %w", err)
+	dataDir, dataGID, err := e.prepareAppData(app)
+	if err != nil {
+		return err
 	}
-	// shipd runs unprivileged (and the unit sets RestrictSUIDSGID), so it
-	// cannot chown the dir to the image's user, nor set the setgid bit.
-	// Group-writability + --group-add is what makes /data usable: whoever the
-	// image runs as joins shipd's group and can write. Files the container
-	// creates keep the container's own uid, so host-side management is via the
-	// directory (shipd owns it) rather than individual file ownership.
-	if err := os.Chmod(dataDir, 0o775); err != nil {
-		log.Printf("shipd: chmod app data dir: %v", err)
-	}
-	dataGID := strconv.Itoa(os.Getgid())
 
 	env = mergeEnv(env, app.Env)
 	runArgs := []string{

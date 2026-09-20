@@ -179,3 +179,75 @@ func TestViewAppMasksEnvValues(t *testing.T) {
 		t.Errorf("env keys not reported (sorted): %v", v.EnvKeys)
 	}
 }
+
+// prepareAppData is the persistence contract: the app's /data directory exists,
+// is group-writable (a non-root image user writes through --group-add), and the
+// by-name symlink exists so the hash-keyed directory is findable. A previous
+// edit dropped the symlink call, leaving the helper defined but never invoked.
+func TestPrepareAppDataCreatesDirAndNameLink(t *testing.T) {
+	dir := t.TempDir()
+	e := &Engine{cfg: &Config{DataDir: dir}}
+	app := &App{Repo: "https://forge.example.net/me/app", Branch: "main", Subdomain: "demo"}
+
+	dataDir, gid, err := e.prepareAppData(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gid == "" {
+		t.Error("gid must be returned for --group-add")
+	}
+	info, err := os.Stat(dataDir)
+	if err != nil {
+		t.Fatalf("data dir not created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatal("data dir is not a directory")
+	}
+	if perm := info.Mode().Perm(); perm != 0o775 {
+		t.Errorf("data dir mode = %o, want 775 (group-writable so the container user can write)", perm)
+	}
+
+	link := filepath.Join(dir, "apps", "by-name", "demo")
+	target, err := os.Readlink(link)
+	if err != nil {
+		t.Fatalf("by-name symlink missing (dead-code regression): %v", err)
+	}
+	if target != dataDir {
+		t.Errorf("by-name link points at %q, want %q", target, dataDir)
+	}
+
+	// idempotent: a redeploy must not fail or duplicate anything
+	if _, _, err := e.prepareAppData(app); err != nil {
+		t.Errorf("second call failed: %v", err)
+	}
+}
+
+// the data directory is keyed by app identity, so a subdomain change keeps the
+// same storage
+func TestPrepareAppDataKeyedByIdentityNotSubdomain(t *testing.T) {
+	dir := t.TempDir()
+	e := &Engine{cfg: &Config{DataDir: dir}}
+
+	first := &App{Repo: "https://forge.example.net/me/app", Branch: "main", Subdomain: "alpha"}
+	d1, _, err := e.prepareAppData(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	renamed := &App{Repo: "https://forge.example.net/me/app", Branch: "main", Subdomain: "beta"}
+	d2, _, err := e.prepareAppData(renamed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d1 != d2 {
+		t.Errorf("subdomain change moved the data dir: %s vs %s", d1, d2)
+	}
+	// a different branch is a different app, so it gets its own storage
+	other := &App{Repo: "https://forge.example.net/me/app", Branch: "dev", Subdomain: "alpha"}
+	d3, _, err := e.prepareAppData(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d3 == d1 {
+		t.Error("a different branch must not share the data dir")
+	}
+}
