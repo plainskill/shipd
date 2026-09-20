@@ -50,17 +50,6 @@
   <h1>shipd</h1>
   <div class="body">git in, containers out. deploys land at &lt;name&gt;.apps.plainskill.net with automatic TLS.</div>
 
-  <div class="label">access</div>
-  <div class="panel" id="authpanel">
-    <form id="authform">
-      <div class="field"><input id="authtoken" type="password" placeholder="API token — the token managing this dashboard" autocomplete="off" required></div>
-      <div class="actions">
-        <button class="quiet" type="submit">unlock &rarr;</button>
-        <span id="authstate" class="msg body"></span>
-      </div>
-    </form>
-  </div>
-
   <div class="label">deploy</div>
   <div class="panel">
     <form id="deploy">
@@ -95,16 +84,13 @@
   </footer>
 </div>
 <script>
-var KEY = "shipd_token";
-function stok() { return localStorage.getItem(KEY) || ""; }
-function authH() {
-  var t = stok();
-  return t ? { "Authorization": "Basic " + btoa("shipd:" + t) } : {};
-}
-function api(url, opts) {
+function api(path, opts) {
+  // the dashboard is protected by the abm gate at Caddy, not by tokens.
+  // /dash/* endpoints are unauthenticated at shipd; /api/* (token) is for
+  // programmatic use.
   opts = opts || {};
-  opts.headers = Object.assign({}, opts.headers || {}, authH());
-  return fetch(url, opts);
+  opts.headers = Object.assign({}, opts.headers || {});
+  return fetch(path, opts);
 }
 function esc(s) { return (s || "").replace(/[&<>"]/g, function(c) {
   return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
@@ -112,17 +98,14 @@ function esc(s) { return (s || "").replace(/[&<>"]/g, function(c) {
 function shortRepo(u) { return u.replace(/^https?:\/\//, "").replace(/^git@/, "").replace(/\.git$/, ""); }
 function fmtDate(iso) { try { return new Date(iso).toLocaleString(); } catch (e) { return iso; } }
 function badge(status) { return '<span class="badge b-' + esc(status) + '">' + esc(status) + '</span>'; }
-function authed() { return !!stok(); }
-function authHint(el) { if (!authed()) { el.textContent = "enter an API token above to manage."; return false; } return true; }
 
 function loadApps() {
-  api("/api/apps").then(function(r) {
-    if (r.status === 401) { document.getElementById("authstate").textContent = "401 — token invalid or not set."; return null; }
+  api("/dash/apps").then(function(r) {
+    if (r.status === 401) { return null; }
     return r.json();
   }).then(function(apps) {
     if (!apps) return;
     var el = document.getElementById("apps");
-    if (!authHint(el)) return;
     if (!apps.length) { el.textContent = "no apps yet — deploy one above."; return; }
     var html = "";
     for (var i = 0; i < apps.length; i++) {
@@ -137,7 +120,7 @@ function loadApps() {
         + (a.last_error ? '<div class="meta err">' + esc(a.last_error) + '</div>' : '')
         + '<div class="meta">last deploy: ' + esc(a.last_deploy ? fmtDate(a.last_deploy) : "never") + '</div>'
         + '<div class="actions">'
-        + '<a href="/api/apps/' + esc(a.subdomain) + '/logs">logs</a> &nbsp; '
+        + '<a href="/dash/apps/' + esc(a.subdomain) + '/logs">logs</a> &nbsp; '
         + '<button class="quiet" onclick="act(\'' + esc(a.subdomain) + '\',\'redeploy\')">redeploy</button> &nbsp; '
         + (a.desired_up
             ? '<button class="quiet" onclick="act(\'' + esc(a.subdomain) + '\',\'stop\')">stop</button> &nbsp; '
@@ -150,25 +133,24 @@ function loadApps() {
 }
 
 function act(sub, action) {
-  api("/api/apps/" + sub + "/" + action, { method: "POST" });
+  api("/dash/apps/" + sub + "/" + action, { method: "POST" });
   setTimeout(loadApps, 400);
 }
 
 function del(sub) {
   if (!confirm("delete " + sub + "? container and state are removed.")) return;
-  api("/api/apps/" + sub + "/delete", { method: "POST" });
+  api("/dash/apps/" + sub + "/delete", { method: "POST" });
   setTimeout(loadApps, 500);
 }
 
 function loadTokens() {
-  api("/api/tokens").then(function(r) {
-    if (r.status === 401) { document.getElementById("authstate").textContent = "401 — token invalid or not set."; return null; }
+  api("/dash/tokens").then(function(r) {
+    if (r.status === 401) { return null; }
     return r.json();
   }).then(function(toks) {
     if (!toks) return;
     var el = document.getElementById("tokens");
-    if (!authed()) { el.textContent = ""; return; }
-    if (!toks.length) { el.textContent = "no managed tokens. the token you are using is enough to create more below."; return; }
+    if (!toks.length) { el.textContent = "no managed tokens. create one below for programmatic deploys."; return; }
     var html = "";
     for (var i = 0; i < toks.length; i++) {
       var t = toks[i];
@@ -192,38 +174,16 @@ function loadTokens() {
 
 function revoke(id, name) {
   if (!confirm("revoke token '" + name + "'? anything using it stops working.")) return;
-  api("/api/tokens/" + id + "/revoke", { method: "POST" });
+  api("/dash/tokens/" + id + "/revoke", { method: "POST" });
   setTimeout(loadTokens, 400);
 }
-
-document.getElementById("authform").addEventListener("submit", function(ev) {
-  ev.preventDefault();
-  var tok = document.getElementById("authtoken").value.trim();
-  if (!tok) return;
-  localStorage.setItem(KEY, tok);
-  document.getElementById("authtoken").value = "";
-  var st = document.getElementById("authstate");
-  st.textContent = "";
-  api("/api/apps").then(function(r) {
-    if (r.status === 401) {
-      localStorage.removeItem(KEY);
-      st.textContent = "token rejected — check it and retry.";
-      st.className = "msg err";
-    } else {
-      st.textContent = "unlocked.";
-      st.className = "msg ok";
-      loadApps(); loadTokens();
-    }
-  });
-});
 
 document.getElementById("deploy").addEventListener("submit", function(ev) {
   ev.preventDefault();
   var msg = document.getElementById("deploymsg");
   msg.textContent = "queueing...";
   msg.className = "msg body";
-  if (!authed()) { msg.textContent = "enter an API token above first."; msg.className = "msg err"; return; }
-  api("/api/deploy", {
+  api("/dash/deploy", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -255,8 +215,7 @@ document.getElementById("tokform").addEventListener("submit", function(ev) {
   var box = document.getElementById("newtoken");
   msg.textContent = "";
   box.innerHTML = "";
-  if (!authed()) { msg.textContent = "enter an API token above first."; msg.className = "msg err"; return; }
-  api("/api/tokens", {
+  api("/dash/tokens", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: document.getElementById("tokname").value.trim() })

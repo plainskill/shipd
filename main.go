@@ -49,9 +49,21 @@ func main() {
 	mux.Handle("GET /api/tokens", eng.guard(http.HandlerFunc(eng.handleTokensList)))
 	mux.Handle("POST /api/tokens", eng.guard(http.HandlerFunc(eng.handleTokenCreate)))
 	mux.Handle("POST /api/tokens/{id}/revoke", eng.guard(http.HandlerFunc(eng.handleTokenRevoke)))
+	// dashboard endpoints: NO token auth at this layer — the abm gate at
+	// Caddy is the access control for the UI. API tokens are exclusively
+	// for programmatic deploys.
+	mux.HandleFunc("GET /dash/apps", handleAppsList(st))
+	mux.HandleFunc("POST /dash/deploy", eng.handleDeploy)
+	mux.HandleFunc("POST /dash/apps/{subdomain}/stop", eng.handleAction(actionStop))
+	mux.HandleFunc("POST /dash/apps/{subdomain}/start", eng.handleAction(actionStart))
+	mux.HandleFunc("POST /dash/apps/{subdomain}/redeploy", eng.handleAction(actionRedeploy))
+	mux.HandleFunc("POST /dash/apps/{subdomain}/delete", eng.handleAction(actionDelete))
+	mux.HandleFunc("GET /dash/apps/{subdomain}/logs", eng.handleLogs)
+	mux.HandleFunc("GET /dash/tokens", eng.handleTokensList)
+	mux.HandleFunc("POST /dash/tokens", eng.handleTokenCreate)
+	mux.HandleFunc("POST /dash/tokens/{id}/revoke", eng.handleTokenRevoke)
 	// dashboard: unauthenticated at this layer — the abm gate at Caddy is
-	// the access control for the UI; the page authenticates API calls with
-	// a token from localStorage
+	// the access control for the UI
 	mux.Handle("GET /{$}", http.HandlerFunc(eng.handleDashboard))
 
 	srvs := []*http.Server{newServer(cfg.Listen, mux)}
