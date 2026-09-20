@@ -74,13 +74,18 @@ func (s *State) Update(key string, fn func(a *App)) {
 // ---- engine operations ------------------------------------------------
 
 func (e *Engine) runDocker(timeout time.Duration, args ...string) (string, error) {
-	return runCmd(timeout, "docker", args...)
+	return runCmdEnv(timeout, "docker", args...)
 }
 
 func runCmd(timeout time.Duration, name string, args ...string) (string, error) {
+	return runCmdEnv(timeout, name, args...)
+}
+
+func runCmdEnv(timeout time.Duration, name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Env = dockerEnv()
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
@@ -211,6 +216,14 @@ func (e *Engine) readDeck(src string) shipdJSON {
 		}
 	}
 	return m
+}
+
+// dockerEnv returns the environment with a writable HOME under the shipd
+// data dir (systemd ProtectHome=tmpfs leaves no usable HOME for buildx).
+func dockerEnv() []string {
+	home := filepath.Join(dataRoot(), "home")
+	_ = osMkdirAll(home, 0o750)
+	return append(os.Environ(), "HOME="+home)
 }
 
 // checkout clones (depth 1) or updates a repo working copy at dst.
@@ -516,3 +529,7 @@ func tail(s string, n int) string {
 }
 
 func portStr(n int) string { return fmt.Sprint(n) }
+
+func dataRoot() string { return "/data/shipd" }
+
+func osMkdirAll(path string, perm os.FileMode) error { return os.MkdirAll(path, perm) }

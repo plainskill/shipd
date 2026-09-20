@@ -1,0 +1,44 @@
+# shipd apps-routing: Traefik discovers app containers on shipd-net via
+# the traefik.* labels shipd sets at docker run. Caddy fronts this (80/443
+# stay on Caddy); this Traefik listens on 81 inside the docker networks only.
+services:
+  traefik:
+    image: traefik:v3.7
+    container_name: shipd-router
+    restart: always
+    command:
+      - --providers.docker=true
+      - --providers.docker.endpoint=tcp://docker-socket-proxy:2375
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=shipd-net
+      - --entryPoints.web.address=:81
+      - --ping=true
+      - --api=false
+    environment:
+      - DOCKER_HOST=tcp://docker-socket-proxy:2375
+      - DOCKER_API_VERSION=1.44
+    networks:
+      - shipd-net
+      - dash-net
+    labels:
+      - com.centurylinklabs.watchtower.enable=false
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    mem_limit: 512m
+    pids_limit: 256
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  shipd-net:
+    external: true
+  dash-net:
+    external: true

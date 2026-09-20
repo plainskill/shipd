@@ -13,8 +13,16 @@ import (
 
 // Config is the shipd control-plane configuration, loaded from JSON.
 type Config struct {
-	Listen   string `json:"listen"`
-	Domain   string `json:"domain"`   // e.g. apps.plainskill.net
+	Listen string `json:"listen"` // primary listen address
+
+	// ListenExtra are additional listen addresses. Used to expose the API on
+	// a docker bridge gateway IP (e.g. 172.30.0.1:8900) so a containerized
+	// reverse proxy (Caddy) can reach the host process. Never exposed
+	// publicly: UFW default-deny covers non-loopback, and the address only
+	// exists on shipd-net.
+	ListenExtra []string `json:"listen_extra"`
+
+	Domain   string `json:"domain"` // e.g. apps.plainskill.net
 	APIToken string `json:"api_token"`
 	DataDir  string `json:"data_dir"`
 
@@ -90,17 +98,17 @@ func validSubdomain(s string) error {
 	return nil
 }
 
-// validRepoURL accepts https:// and git@ git URLs only.
+// validRepoURL accepts https:// and git@ git URLs, with or without ".git".
 func validRepoURL(s string) bool {
 	if strings.HasPrefix(s, "https://") {
 		u, err := url.Parse(s)
-		return err == nil && u.Host != "" && strings.HasSuffix(u.Path, ".git")
+		return err == nil && u.Host != "" && strings.Contains(u.Path, "/")
 	}
 	if strings.HasPrefix(s, "git@") {
-		// git@host:path/to/repo.git
+		// git@host:path/to/repo(.git)
 		rest := strings.TrimPrefix(s, "git@")
 		host, path, ok := strings.Cut(rest, ":")
-		return ok && host != "" && strings.HasPrefix(path, "/") && strings.HasSuffix(path, ".git")
+		return ok && host != "" && strings.HasPrefix(path, "/")
 	}
 	return false
 }

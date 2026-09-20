@@ -1,0 +1,27 @@
+[Unit]
+Description=shipd - single-user PaaS control plane
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=plainskill
+Group=plainskill
+ExecStart=/usr/local/bin/shipd -config /etc/shipd/config.json
+Restart=on-failure
+RestartSec=5
+# shipd shells out to docker; give it the docker group, not root
+SupplementaryGroups=docker
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+# shipd writes state, builds, and its own config dir (token rotation)
+ReadWritePaths=/data/shipd /etc/shipd
+# git+docker need /tmp; PrivateTmp gives each service its own
+PrivateTmp=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

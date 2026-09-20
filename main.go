@@ -47,14 +47,32 @@ func main() {
 	mux.Handle("GET /api/apps/{subdomain}/logs", eng.guard(http.HandlerFunc(eng.handleLogs)))
 	mux.Handle("GET /", eng.guard(http.HandlerFunc(eng.handleDashboard)))
 
-	srv := &http.Server{
-		Addr:              cfg.Listen,
-		Handler:           mux,
+	srvs := []*http.Server{newServer(cfg.Listen, mux)}
+	for _, addr := range cfg.ListenExtra {
+		srvs = append(srvs, newServer(addr, mux))
+	}
+	for _, s := range srvs {
+		log.Printf("shipd: listening on %s", s.Addr)
+	}
+	log.Printf("shipd: ask URL for Caddy on_demand_tls: http://172.30.0.1:8900/check?t=%s", cfg.AskToken())
+	log.Printf("shipd: zone %s (%d apps)", cfg.Domain, len(st.Apps))
+	for _, s := range srvs[1:] {
+		go func(s *http.Server) {
+			if err := s.ListenAndServe(); err != nil {
+				log.Fatalf("shipd: %s: %v", s.Addr, err)
+			}
+		}(s)
+	}
+	log.Fatal(srvs[0].ListenAndServe())
+}
+
+func newServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-	log.Printf("shipd: listening on %s (domain=%s apps=%d)", cfg.Listen, cfg.Domain, len(st.Apps))
-	log.Fatal(srv.ListenAndServe())
 }

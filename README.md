@@ -72,3 +72,14 @@ on-demand TLS with `ask` pointing at shipd `/check` (token in query). shipd
 answers OK only for provisioned app domains. Traffic path:
 
     browser -> Caddy (TLS) -> traefik (apps-routing, :81 on caddy/shipd-net) -> app container
+
+## Ops notes (pscA)
+
+- shipd-net is a fixed-subnet bridge (172.16.0.0/24, gateway 172.16.0.1);
+  shipd additionally listens on the gateway IP so containerized Caddy can
+  reach the host process. UFW allows only shipd-net -> 8900.
+- The Caddy `ask` URL embeds the derived ask token (sha256("shipd-ask:"+api_token)
+  truncated to 32 hex) — rotate api_token in /etc/shipd/config.json AND the
+  ask URL in the Caddyfile together.
+- systemd unit hardening: ProtectSystem=strict, ProtectHome=tmpfs (shipd sets
+  HOME=/data/shipd/home for docker buildx), no caps, docker via SupplementaryGroups.
