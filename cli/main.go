@@ -517,8 +517,16 @@ func cmdDeploy(args []string) {
 		payload["env_unset"] = unset
 	}
 	if len(env) > 0 || len(unset) > 0 {
+		// list what ends up set: keys removed by --env-unset are not "env"
+		removed := map[string]bool{}
+		for _, k := range unset {
+			removed[k] = true
+		}
 		keys := make([]string, 0, len(env))
 		for k := range env {
+			if removed[k] {
+				continue
+			}
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
@@ -532,10 +540,16 @@ func cmdDeploy(args []string) {
 		if len(unset) > 0 {
 			sources = append(sources, fmt.Sprintf("%d unset", len(unset)))
 		}
+		summary := strings.Join(sources, ", ")
 		if len(keys) > 0 {
-			fmt.Printf("env: %s (%s)\n", strings.Join(keys, ", "), strings.Join(sources, ", "))
+			fmt.Printf("env: %s (%s)\n", strings.Join(keys, ", "), summary)
 		} else {
-			fmt.Printf("env: %s\n", strings.Join(sources, ", "))
+			fmt.Printf("env: %s\n", summary)
+		}
+		if len(unset) > 0 {
+			ul := append([]string{}, unset...)
+			sort.Strings(ul)
+			fmt.Printf("env unset: %s\n", strings.Join(ul, ", "))
 		}
 	}
 	code, body, err := api("POST", "/api/deploy", payload)
