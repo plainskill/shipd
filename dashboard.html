@@ -115,11 +115,10 @@ function loadApps() {
         + badge(a.status)
         + '</div>'
         + '<div class="meta">' + esc(shortRepo(a.repo)) + ' @ ' + esc(a.branch)
-        + (a.git_sha ? ' @ ' + esc(a.git_sha) : '') + '</div>'
+        + (a.git_sha ? ' &middot; ' + esc(a.git_sha) : '') + '</div>'
         + (a.last_error ? '<div class="meta err">' + esc(a.last_error) + '</div>' : '')
         + '<div class="meta">last deploy: ' + esc(a.last_deploy ? fmtDate(a.last_deploy) : "never") + '</div>'
         + '<div class="actions">'
-        + '<a href="/dash/apps/' + esc(a.subdomain) + '/logs">logs</a> &nbsp; '
         + '<a href="/dash/apps/' + encodeURIComponent(a.subdomain) + '/logs">logs</a> &nbsp; '
         + '<button class="quiet" data-act="redeploy" data-sub="' + esc(a.subdomain) + '">redeploy</button> &nbsp; '
         + (a.desired_up

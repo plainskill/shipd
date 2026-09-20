@@ -71,6 +71,7 @@ setTimeout(() => {
   check(apps.includes('data-act="redeploy"'), "apps panel missing redeploy button");
   check(apps.includes('data-act="delete"'), "apps panel missing delete button");
   check(!apps.includes("onclick="), "apps panel still uses inline onclick");
+  check((apps.match(/>logs<\/a>/g) || []).length === 1, "logs link is duplicated in the apps panel");
   check(toks.includes("data-revoke=\"87b06b5c\""), "tokens panel missing revoke button with id");
   check(!toks.includes("onclick="), "tokens panel still uses inline onclick");
   check(!toks.includes("<x>"), "token name was not escaped in the markup");
