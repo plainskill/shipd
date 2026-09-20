@@ -14,7 +14,7 @@ that lives *behind* an existing reverse proxy instead of replacing it.
 ## Deploy something
 
     curl -u :$TOKEN https://shipd.plainskill.net/api/deploy \
-      -d '{"repo": "https://git.plainskill.net/plainskill/shipd-example.git",
+      -d '{"repo": "https://gt.plainskill.net/plainskill/shipd-example.git",
            "branch": "main",
            "subdomain": "example"}'
 

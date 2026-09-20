@@ -2,7 +2,7 @@
 #
 # shipd CLI installer.
 #
-#   curl -fsSL https://git.plainskill.net/plainskill/shipd/raw/branch/main/install.sh | sh
+#   curl -fsSL https://gt.plainskill.net/plainskill/shipd/raw/branch/main/install.sh | sh
 #
 # Downloads the latest release binary for this platform, verifies its
 # sha256 against the release SHA256SUMS, and installs it to ~/.local/bin
@@ -10,7 +10,7 @@
 #
 set -eu
 
-RELEASE_BASE="${SHIPD_RELEASE_BASE:-https://git.plainskill.net/plainskill/shipd}"
+RELEASE_BASE="${SHIPD_RELEASE_BASE:-https://gt.plainskill.net/plainskill/shipd}"
 BIN_DIR="${SHIPD_BIN_DIR:-$HOME/.local/bin}"
 VERSION="${SHIPD_VERSION:-}"
 
