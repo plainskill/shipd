@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -28,7 +30,8 @@ type Engine struct {
 	cfg *Config
 	st  *State
 
-	// mu serializes deploy pipelines (one build at a time; single-user box).
+	// mu serializes deploy pipelines AND stop/delete (single-user box; one
+	// mutating operation at a time so state and containers can't diverge).
 	mu sync.Mutex
 }
 
@@ -49,6 +52,13 @@ const (
 
 // Key returns the app identity: repo|branch.
 func (a *App) Key() string { return appKey(a.Repo, a.Branch) }
+
+// hashKey returns a short collision-resistant hash of the app key, used in
+// image tags and build dirs so slug-folded repos can't cross-wire.
+func hashKey(key string) string {
+	h := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(h[:])[:8]
+}
 
 // containerName is the stable name of the app's running container.
 func (a *App) containerName() string { return "shipd-app-" + a.Subdomain }
@@ -71,24 +81,36 @@ func (s *State) Update(key string, fn func(a *App)) {
 	s.Save()
 }
 
-// ---- engine operations ------------------------------------------------
+// ---- process helpers ---------------------------------------------------
 
 func (e *Engine) runDocker(timeout time.Duration, args ...string) (string, error) {
-	return runCmdEnv(timeout, "docker", args...)
+	return e.runCmdEnv(timeout, "docker", args...)
 }
 
-func runCmd(timeout time.Duration, name string, args ...string) (string, error) {
-	return runCmdEnv(timeout, name, args...)
-}
-
-func runCmdEnv(timeout time.Duration, name string, args ...string) (string, error) {
+// runCmdEnv runs a command with a writable HOME under the shipd data dir
+// (systemd ProtectHome=tmpfs leaves no usable HOME for git/docker buildx).
+func (e *Engine) runCmdEnv(timeout time.Duration, name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Env = dockerEnv()
+	home := filepath.Join(e.cfg.DataDir, "home")
+	if err := os.MkdirAll(home, 0o750); err != nil {
+		log.Printf("shipd: warning: cannot create HOME %s: %v", home, err)
+	}
+	cmd.Env = append(os.Environ(), "HOME="+home)
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
+
+func runCmd(timeout time.Duration, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	out, err := cmd.CombinedOutput()
+	return strings.TrimSpace(string(out)), err
+}
+
+// ---- state operations ---------------------------------------------------
 
 // Upsert creates or updates the app record for repo+branch with subdomain.
 func (e *Engine) Upsert(repo, branch, subdomain string) *App {
@@ -107,7 +129,8 @@ func (e *Engine) Upsert(repo, branch, subdomain string) *App {
 	}
 	a.Subdomain = subdomain
 	a.Domain = subdomain + "." + e.cfg.Domain
-	a.Image = fmt.Sprintf("%s/shipd/%s:%s", registryHost, slug(repo), slug(branch))
+	// hashKey disambiguates slug-folded repos (https://x/a-b vs https://x/a/b)
+	a.Image = fmt.Sprintf("%s/shipd/%s-%s:%s", registryHost, slug(repo), hashKey(key), slug(branch))
 	a.Status = StatusQueued
 	a.DesiredUp = true
 	a.LastDeploy = now
@@ -172,8 +195,16 @@ func (e *Engine) EnsureNetwork() error {
 	return nil
 }
 
-// Reconcile aligns status with reality (e.g. after a host reboot).
+// Reconcile aligns status with reality (e.g. after a host reboot) and cleans
+// up temp containers orphaned by a restart mid-deploy.
 func (e *Engine) Reconcile() {
+	// orphaned temps from a mid-deploy crash
+	if out, _ := e.runDocker(30*time.Second, "ps", "-aq", "--filter", "name=shipd-new-"); out != "" {
+		for _, id := range strings.Fields(out) {
+			_, _ = e.runDocker(time.Minute, "rm", "-f", id)
+		}
+		log.Println("shipd: cleaned orphaned temp containers")
+	}
 	type ent struct {
 		key     string
 		desired bool
@@ -218,19 +249,26 @@ func (e *Engine) readDeck(src string) shipdJSON {
 	return m
 }
 
-// dockerEnv returns the environment with a writable HOME under the shipd
-// data dir (systemd ProtectHome=tmpfs leaves no usable HOME for buildx).
-func dockerEnv() []string {
-	home := filepath.Join(dataRoot(), "home")
-	_ = osMkdirAll(home, 0o750)
-	return append(os.Environ(), "HOME="+home)
+// deckPaths resolves the build context dir and Dockerfile path from a deck.
+// Dockerfile may be relative to the repo root; context may be a subdir.
+func deckPaths(src string, deck shipdJSON) (ctxDir, dockerfile string) {
+	ctxDir = src
+	if deck.Context != "" {
+		ctxDir = filepath.Join(src, deck.Context)
+	}
+	dockerfile = filepath.Join(src, orDefault(deck.Dockerfile, "Dockerfile"))
+	return ctxDir, dockerfile
 }
 
 // checkout clones (depth 1) or updates a repo working copy at dst.
+// A failed clone removes dst so the next deploy starts clean (a partial
+// clone without .git would otherwise wedge the fetch path forever).
 func (e *Engine) checkout(repo, branch, dst string) (string, error) {
 	if _, err := os.Stat(filepath.Join(dst, ".git")); err != nil {
-		if out, err := runCmd(5*time.Minute, "git", "clone", "--depth", "1", "--branch", branch,
-			"--single-branch", repo, dst); err != nil {
+		out, err := runCmd(5*time.Minute, "git", "clone", "--depth", "1", "--branch", branch,
+			"--single-branch", repo, dst)
+		if err != nil {
+			os.RemoveAll(dst)
 			return out, fmt.Errorf("clone %s@%s: %v: %s", repo, branch, err, tail(out, 200))
 		}
 	} else {
@@ -244,7 +282,10 @@ func (e *Engine) checkout(repo, branch, dst string) (string, error) {
 	return runCmd(15*time.Second, "git", "-C", dst, "rev-parse", "HEAD")
 }
 
-// RunDeploy is the full pipeline: checkout -> build -> run -> health -> swap.
+// RunDeploy is the pipeline: checkout -> build -> probe temp (unrouted) ->
+// promote to stable (routed). The temp container carries NO traefik router
+// labels, so unvalidated code never serves live traffic; on probe failure
+// the old version keeps serving untouched.
 func (e *Engine) RunDeploy(key string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -253,7 +294,7 @@ func (e *Engine) RunDeploy(key string) {
 	if app == nil {
 		return
 	}
-	src := filepath.Join(e.cfg.BuildsDir(), slug(app.Repo)+"-"+slug(app.Branch))
+	src := filepath.Join(e.cfg.BuildsDir(), slug(app.Repo)+"-"+hashKey(key))
 	started := time.Now()
 
 	fail := func(err error) {
@@ -275,11 +316,12 @@ func (e *Engine) RunDeploy(key string) {
 	e.st.Update(key, func(a *App) { a.GitSHA = short(sha) })
 	log.Printf("shipd: %s building %s", app.Subdomain, short(sha))
 
-	// 2. resolve port: shipd.json -> Dockerfile EXPOSE
+	// 2. resolve port: shipd.json -> EXPOSE (in the deck-resolved Dockerfile)
 	deck := e.readDeck(src)
+	ctxDir, dockerfile := deckPaths(src, deck)
 	port := deck.Port
 	if port == 0 {
-		port = exposedPort(src)
+		port = exposedPort(dockerfile)
 	}
 	if port == 0 {
 		fail(fmt.Errorf("no listen port: add shipd.json {\"port\": N} or EXPOSE in Dockerfile"))
@@ -290,12 +332,12 @@ func (e *Engine) RunDeploy(key string) {
 	image := app.Image
 	buildArgs := []string{
 		"build",
-		"-f", filepath.Join(src, orDefault(deck.Dockerfile, "Dockerfile")),
+		"-f", dockerfile,
 		"-t", image,
 		"--network", "host",
 		"--label", "shipd.app=" + key,
 		"--label", "shipd.subdomain=" + app.Subdomain,
-		src,
+		ctxDir,
 	}
 	if out, err := e.runDocker(30*time.Minute, buildArgs...); err != nil {
 		fail(fmt.Errorf("build: %v: %s", err, tail(out, 500)))
@@ -307,7 +349,8 @@ func (e *Engine) RunDeploy(key string) {
 		log.Printf("shipd: push %s failed (continuing with local image): %v: %s", image, err, tail(out, 200))
 	}
 
-	// 5. run new version under a temp name with routing labels
+	// 5. run new version under a temp name WITHOUT router labels — it must
+	// not receive live traffic until validated
 	temp := app.tempContainerName(sha)
 	_, _ = e.runDocker(time.Minute, "rm", "-f", temp) // stale same-sha container
 	runArgs := []string{
@@ -317,11 +360,6 @@ func (e *Engine) RunDeploy(key string) {
 		"--label", "shipd.app=" + key,
 		"--label", "shipd.subdomain=" + app.Subdomain,
 		"--label", "shipd.port=" + fmt.Sprint(port),
-		"--label", "traefik.enable=true",
-		"--label", "traefik.docker.network=" + shipdNetwork,
-		"--label", "traefik.http.routers.app-" + app.Subdomain + ".rule=Host(`" + app.Domain + "`)",
-		"--label", "traefik.http.routers.app-" + app.Subdomain + ".entrypoints=web",
-		"--label", "traefik.http.services.app-" + app.Subdomain + ".loadbalancer.server.port=" + fmt.Sprint(port),
 	}
 	for _, env := range deck.Env {
 		runArgs = append(runArgs, "--env", env)
@@ -332,7 +370,8 @@ func (e *Engine) RunDeploy(key string) {
 		return
 	}
 
-	// 6. health check; on failure remove temp — old version keeps serving
+	// 6. health check the temp directly by IP; on failure remove it — the
+	// old version never stopped serving
 	if !e.waitHealthy(temp, healthTimeout) {
 		state, _ := e.runDocker(10*time.Second, "inspect", "-f", "{{.State.Status}}", temp)
 		logs, _ := e.runDocker(15*time.Second, "logs", "--tail", "20", temp)
@@ -342,26 +381,62 @@ func (e *Engine) RunDeploy(key string) {
 		return
 	}
 
-	// 7. swap: remove old stable container, promote temp
-	stable := app.containerName()
-	_, _ = e.runDocker(time.Minute, "rm", "-f", stable)
-	if out, err := e.runDocker(time.Minute, "rename", temp, stable); err != nil {
-		log.Printf("shipd: rename %s -> %s: %v: %s (continuing; routing is label-based)",
-			temp, stable, err, out)
+	// 7. promote. Re-check state first: a delete/stop may have landed while
+	// we were building.
+	current := e.st.Get(key)
+	if current == nil {
+		_, _ = e.runDocker(time.Minute, "rm", "-f", temp)
+		log.Printf("shipd: %s deleted during deploy; discarding build", app.Subdomain)
+		return
 	}
+	if !current.DesiredUp {
+		_, _ = e.runDocker(time.Minute, "rm", "-f", temp)
+		e.st.Update(key, func(a *App) { a.Status = StatusStopped })
+		log.Printf("shipd: %s stopped during deploy; discarding build", app.Subdomain)
+		return
+	}
+
+	// remove the old stable + any orphaned containers for this app key
+	// (covers subdomain reassignment: old-name containers carry the same
+	// shipd.app label)
+	e.removeAppContainers(key, temp)
+
+	// run the validated image under the stable name WITH router labels
+	if err := e.runContainer(current, image, port, deck.Env); err != nil {
+		fail(fmt.Errorf("promote: %v", err))
+		_, _ = e.runDocker(time.Minute, "rm", "-f", temp)
+		return
+	}
+	if !e.waitHealthy(current.containerName(), 15*time.Second) {
+		fail(fmt.Errorf("promoted container failed immediate probe; check logs"))
+		// keep it running — Traefik routes to it; operator can inspect
+	}
+	_, _ = e.runDocker(time.Minute, "rm", "-f", temp)
 
 	e.st.Update(key, func(a *App) {
 		a.Status = StatusRunning
 		a.Port = port
-		a.Container = stable
+		a.Container = current.containerName()
 		a.LastError = ""
 		a.LastDeploy = time.Now().UTC()
 	})
 	log.Printf("shipd: %s deployed %s in %s", app.Subdomain, short(sha), time.Since(started).Round(time.Second))
 }
 
+// removeAppContainers removes every container labeled for this app key
+// except the one named in keep.
+func (e *Engine) removeAppContainers(key, keep string) {
+	out, _ := e.runDocker(30*time.Second, "ps", "-q", "--filter", "label=shipd.app="+key)
+	for _, id := range strings.Fields(out) {
+		if id != keep {
+			e.runDocker(30*time.Second, "rm", "-f", id)
+		}
+	}
+}
+
 // waitHealthy probes http://<ip>:<port>/ until it answers or timeout.
-// The port comes from the container's shipd.port label.
+// Any HTTP response counts as healthy (the app is up; a 500 is an app-level
+// problem that logs will show). No shipd.port label = skip probing.
 func (e *Engine) waitHealthy(container string, within time.Duration) bool {
 	port := e.portOf(container)
 	if port == 0 {
@@ -406,11 +481,13 @@ func (e *Engine) containerIP(container string) (string, error) {
 
 // RunStop removes the app container (state kept for later start).
 func (e *Engine) RunStop(key string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	app := e.st.Get(key)
 	if app == nil {
 		return
 	}
-	_, _ = e.runDocker(time.Minute, "rm", "-f", app.containerName())
+	e.removeAppContainers(key, "")
 	e.st.Update(key, func(a *App) {
 		a.DesiredUp = false
 		a.Status = StatusStopped
@@ -418,59 +495,89 @@ func (e *Engine) RunStop(key string) {
 	log.Printf("shipd: %s stopped", app.Subdomain)
 }
 
-// RunStart re-creates the container from the last built image.
+// RunStart re-creates the container from the last built image, re-applying
+// shipd.json env and routing labels (same set as deploy).
 func (e *Engine) RunStart(key string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	app := e.st.Get(key)
 	if app == nil {
 		return
 	}
-	if app.Image == "" || app.Port == 0 {
-		e.st.Update(key, func(a *App) { a.LastError = "never deployed or unknown port; redeploy instead" })
+	if app.Image == "" {
+		e.st.Update(key, func(a *App) { a.LastError = "never deployed; nothing to start" })
 		return
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if err := e.runContainer(app, app.Image); err != nil {
+	// re-read the repo's shipd.json so env/labels survive stop->start
+	src := filepath.Join(e.cfg.BuildsDir(), slug(app.Repo)+"-"+hashKey(key))
+	deck := e.readDeck(src)
+	port := app.Port
+	if port == 0 {
+		port = deck.Port
+	}
+	if port == 0 {
+		port = exposedPort(filepath.Join(src, orDefault(deck.Dockerfile, "Dockerfile")))
+	}
+	if port == 0 {
+		e.st.Update(key, func(a *App) { a.LastError = "unknown port; redeploy instead" })
+		return
+	}
+	if err := e.runContainer(app, app.Image, port, deck.Env); err != nil {
 		e.st.Update(key, func(a *App) { a.LastError = "start failed: " + err.Error() })
 		log.Printf("shipd: start %s failed: %v", app.Subdomain, err)
 		return
 	}
+	status := StatusRunning
+	lastErr := ""
+	if !e.waitHealthy(app.containerName(), 15*time.Second) {
+		log.Printf("shipd: %s started but did not answer probe within 15s (check logs)", app.Subdomain)
+	}
 	e.st.Update(key, func(a *App) {
 		a.DesiredUp = true
-		a.Status = StatusRunning
+		a.Status = status
+		a.Port = port
 		a.Container = app.containerName()
+		a.LastError = lastErr
 	})
 	log.Printf("shipd: %s started", app.Subdomain)
 }
 
-// runContainer starts the stable-named container for an app with routing labels.
-func (e *Engine) runContainer(app *App, image string) error {
-	_, _ = e.runDocker(time.Minute, "rm", "-f", app.containerName())
+// runContainer starts the stable-named container for an app with the full
+// routing + env + port label set (used by deploy promotion and start).
+func (e *Engine) runContainer(app *App, image string, port int, env []string) error {
 	runArgs := []string{
 		"run", "-d", "--name", app.containerName(),
 		"--network", shipdNetwork,
 		"--restart", "unless-stopped",
 		"--label", "shipd.app=" + app.Key(),
 		"--label", "shipd.subdomain=" + app.Subdomain,
+		"--label", "shipd.port=" + fmt.Sprint(port),
 		"--label", "traefik.enable=true",
 		"--label", "traefik.docker.network=" + shipdNetwork,
 		"--label", "traefik.http.routers.app-" + app.Subdomain + ".rule=Host(`" + app.Domain + "`)",
 		"--label", "traefik.http.routers.app-" + app.Subdomain + ".entrypoints=web",
-		"--label", "traefik.http.services.app-" + app.Subdomain + ".loadbalancer.server.port=" + fmt.Sprint(app.Port),
-		image,
+		"--label", "traefik.http.services.app-" + app.Subdomain + ".loadbalancer.server.port=" + fmt.Sprint(port),
 	}
+	for _, env := range env {
+		runArgs = append(runArgs, "--env", env)
+	}
+	runArgs = append(runArgs, image)
 	if out, err := e.runDocker(2*time.Minute, runArgs...); err != nil {
 		return fmt.Errorf("%v: %s", err, tail(out, 200))
 	}
 	return nil
 }
 
-// RunDelete removes the container and drops the app from state.
+// RunDelete removes everything for an app and drops it from state.
 func (e *Engine) RunDelete(key string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	app := e.st.Get(key)
 	if app == nil {
 		return
 	}
+	// label filter catches containers under old subdomain names too
+	e.removeAppContainers(key, "")
 	_, _ = e.runDocker(time.Minute, "rm", "-f", app.containerName())
 	e.st.mu.Lock()
 	delete(e.st.Apps, key)
@@ -479,9 +586,9 @@ func (e *Engine) RunDelete(key string) {
 	log.Printf("shipd: %s deleted", app.Subdomain)
 }
 
-// exposedPort parses the first EXPOSE from the repo Dockerfile; 0 if none.
-func exposedPort(src string) int {
-	f, err := os.Open(filepath.Join(src, "Dockerfile"))
+// exposedPort parses the first EXPOSE from the given Dockerfile; 0 if none.
+func exposedPort(dockerfilePath string) int {
+	f, err := os.Open(dockerfilePath)
 	if err != nil {
 		return 0
 	}
@@ -529,7 +636,3 @@ func tail(s string, n int) string {
 }
 
 func portStr(n int) string { return fmt.Sprint(n) }
-
-func dataRoot() string { return "/data/shipd" }
-
-func osMkdirAll(path string, perm os.FileMode) error { return os.MkdirAll(path, perm) }

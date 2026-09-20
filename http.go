@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -45,11 +47,13 @@ func httpError(w http.ResponseWriter, code int, msg string) {
 func handleAppsList(st *State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		st.mu.RLock()
-		defer st.mu.RUnlock()
 		out := make([]App, 0, len(st.Apps))
 		for _, a := range st.Apps {
 			out = append(out, *a)
 		}
+		st.mu.RUnlock()
+		// stable order for the dashboard's 5s poll
+		sort.Slice(out, func(i, j int) bool { return out[i].Subdomain < out[j].Subdomain })
 		writeJSON(w, http.StatusOK, out)
 	}
 }
@@ -73,6 +77,10 @@ func (e *Engine) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Branch == "" {
 		req.Branch = "main"
+	}
+	if !validBranch(req.Branch) {
+		httpError(w, http.StatusBadRequest, "invalid branch name")
+		return
 	}
 	if err := validSubdomain(req.Subdomain); err != nil {
 		httpError(w, http.StatusBadRequest, err.Error())
@@ -169,10 +177,14 @@ func (e *Engine) handleLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lines := r.URL.Query().Get("lines")
-	if lines == "" {
-		lines = "200"
+	n, err := strconv.Atoi(lines)
+	if err != nil || n < 1 {
+		n = 200
 	}
-	out, err := e.runDocker(logTimeout, "logs", "--tail", lines, app.containerName())
+	if n > 5000 {
+		n = 5000
+	}
+	out, err := e.runDocker(logTimeout, "logs", "--tail", strconv.Itoa(n), app.containerName())
 	if err != nil && out == "" {
 		httpError(w, http.StatusNotFound, "no container logs: "+err.Error())
 		return

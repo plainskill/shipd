@@ -58,7 +58,7 @@ func main() {
 	for _, s := range srvs {
 		log.Printf("shipd: listening on %s", s.Addr)
 	}
-	log.Printf("shipd: ask URL for Caddy on_demand_tls: http://172.30.0.1:8900/check?t=%s", cfg.AskToken())
+	log.Printf("shipd: ask URL for Caddy on_demand_tls: http://172.16.0.1:8900/check?t=<redacted — see config.json>")
 	log.Printf("shipd: zone %s (%d apps)", cfg.Domain, len(st.Apps))
 	for _, s := range srvs[1:] {
 		go func(s *http.Server) {

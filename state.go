@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -59,7 +60,7 @@ type State struct {
 }
 
 func LoadState(path string) (*State, error) {
-	st := &State{path: path, Apps: map[string]*App{}}
+	st := &State{path: path, Apps: map[string]*App{}, Tokens: map[string]*TokenRecord{}}
 	raw, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return st, nil
@@ -70,29 +71,48 @@ func LoadState(path string) (*State, error) {
 	if err := json.Unmarshal(raw, st); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
+	// null maps in the file (or absent fields) must not stay nil
+	if st.Apps == nil {
+		st.Apps = map[string]*App{}
+	}
+	if st.Tokens == nil {
+		st.Tokens = map[string]*TokenRecord{}
+	}
 	return st, nil
 }
 
-// Save atomically persists the state file. Callers must NOT hold st.mu.
+// Save atomically persists the state file. Errors are logged (a full disk
+// must not silently diverge state from reality).
 func (s *State) Save() {
 	s.mu.RLock()
 	raw, err := json.MarshalIndent(s, "", "  ")
 	s.mu.RUnlock()
 	if err != nil {
+		log.Printf("shipd: state marshal: %v", err)
 		return
 	}
 	dir := filepath.Dir(s.path)
 	tmp, err := os.CreateTemp(dir, ".state-*.json")
 	if err != nil {
+		log.Printf("shipd: state tmp create: %v", err)
 		return
 	}
-	if _, err := tmp.Write(raw); err == nil {
-		_ = tmp.Chmod(0o600)
+	if _, err := tmp.Write(raw); err != nil {
+		log.Printf("shipd: state tmp write: %v", err)
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return
 	}
-	tmp.Close()
-	if err == nil {
-		_ = os.Rename(tmp.Name(), s.path)
-	} else {
+	if err := tmp.Chmod(0o600); err != nil {
+		log.Printf("shipd: state tmp chmod: %v", err)
+	}
+	if err := tmp.Close(); err != nil {
+		log.Printf("shipd: state tmp close: %v", err)
+		os.Remove(tmp.Name())
+		return
+	}
+	if err := os.Rename(tmp.Name(), s.path); err != nil {
+		log.Printf("shipd: state rename: %v", err)
 		os.Remove(tmp.Name())
 	}
 }

@@ -98,17 +98,37 @@ func validSubdomain(s string) error {
 	return nil
 }
 
-// validRepoURL accepts https:// and git@ git URLs, with or without ".git".
+// validBranch rejects git option injection: must look like a ref name,
+// no leading dash, no "..".
+func validBranch(s string) bool {
+	if s == "" || len(s) > 200 {
+		return false
+	}
+	if strings.HasPrefix(s, "-") || strings.Contains(s, "..") {
+		return false
+	}
+	for _, r := range s {
+		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+			r == '/' || r == '.' || r == '_' || r == '-'
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// validRepoURL accepts https:// and git@ (scp-style) git URLs, with or
+// without ".git". Rejects embedded credentials.
 func validRepoURL(s string) bool {
 	if strings.HasPrefix(s, "https://") {
 		u, err := url.Parse(s)
-		return err == nil && u.Host != "" && strings.Contains(u.Path, "/")
+		return err == nil && u.Host != "" && strings.Contains(u.Path, "/") && u.User == nil
 	}
 	if strings.HasPrefix(s, "git@") {
-		// git@host:path/to/repo(.git)
+		// scp-like: git@host:owner/repo(.git) — no leading slash
 		rest := strings.TrimPrefix(s, "git@")
 		host, path, ok := strings.Cut(rest, ":")
-		return ok && host != "" && strings.HasPrefix(path, "/")
+		return ok && host != "" && path != "" && !strings.Contains(path, "//")
 	}
 	return false
 }
