@@ -1,104 +1,178 @@
 # shipd
 
-Single-user PaaS in one Go binary. Git URL + branch + subdomain in, app live at
-`<subdomain>.apps.plainskill.net` out. TLS is automatic (Caddy on-demand TLS,
-gated by shipd's `/check` endpoint). No database — state is one JSON file.
+**Vercel but cheaper.** Point it at a git repo, get a container at
+`<subdomain>.apps.plainskill.net` with automatic TLS. One Go binary, no
+database, single user.
 
-## Why
+```console
+$ shipd deploy
+no subdomain given — using hello
+deploying https://gt.plainskill.net/plainskill/shipd-example.git@main → https://hello.apps.plainskill.net
+  building
+  running
+live at https://hello.apps.plainskill.net
+```
 
-Existing options (Coolify, Dokploy) assume they own the whole box: their own
-proxy on 80/443, their own database, their own concept of "servers". This host
-already runs Caddy as the edge. shipd is the ~800-line answer: a deploy plane
-that lives *behind* an existing reverse proxy instead of replacing it.
+## Install the CLI
 
-## Deploy something
+```sh
+curl -fsSL https://gt.plainskill.net/plainskill/shipd/raw/branch/main/install.sh | sh
+```
 
-    curl -u :$TOKEN https://shipd.plainskill.net/api/deploy \
-      -d '{"repo": "https://gt.plainskill.net/plainskill/shipd-example.git",
-           "branch": "main",
-           "subdomain": "example"}'
+Installs to `~/.local/bin/shipd` (override with `SHIPD_BIN_DIR`), verifies the
+release checksum, supports linux/darwin on amd64/arm64.
 
-App identity is (repo, branch). Re-deploying the same pair replaces it;
-a new subdomain can be assigned anytime by deploying the same pair with a
-different subdomain. Repos may be any git URL reachable from the host
-(GitHub, Forgejo, etc.). Private repos work if the deploy host has a
-deploy key / credential for the URL.
+Then connect it to a server — the CLI is host-agnostic, nothing is baked in:
 
-## shipd.json (optional, in the repo root)
+```sh
+shipd login --server https://your-shipd-host     # prompts for url + token
+shipd whoami                                     # which server, which token
+```
 
-    {
-      "port": 8000,              // container listen port (else: first EXPOSE)
-      "dockerfile": "Dockerfile",
-      "context": ".",            // build context subdir
-      "env": ["KEY=value", ...]  // runtime env vars
-    }
+Tokens are created in the dashboard (`https://<your-shipd-host>/` → *api
+tokens*). `shipd login` verifies the token before storing it, and reads the
+secret without echoing so it never lands in shell history.
 
-## API (Basic auth, user ignored, password = API token)
+## Using it
 
-| Method | Path                              | What                     |
-|--------|-----------------------------------|--------------------------|
-| GET    | /api/apps                         | list apps                |
-| POST   | /api/deploy                       | deploy {repo,branch,subdomain} |
-| POST   | /api/apps/{sub}/redeploy          | rebuild + swap           |
-| POST   | /api/apps/{sub}/stop              | stop (keeps state)       |
-| POST   | /api/apps/{sub}/start             | start from last image    |
-| POST   | /api/apps/{sub}/delete            | remove container + state |
-| GET    | /api/apps/{sub}/logs?lines=200    | container logs           |
-| GET    | /healthz                          | liveness (no auth)       |
-| GET    | /check?domain=...&t=TOKEN         | Caddy on-demand TLS gate |
-| GET    | /api/tokens                       | list managed tokens      |
-| POST   | /api/tokens                       | create token {name} (plaintext shown once) |
-| POST   | /api/tokens/{id}/revoke           | revoke token             |
+| command | what it does |
+|---|---|
+| `shipd deploy` | deploy the repo you're in |
+| `shipd deploy excalidraw` | deploy it on the `excalidraw` subdomain |
+| `shipd deploy --branch dev` | deploy another branch (a separate app) |
+| `shipd delete` | remove this repo's deployment |
+| `shipd delete excalidraw` | remove a named deployment |
+| `shipd apps` | list deployments |
+| `shipd logs [subdomain]` | container logs |
 
-Managed tokens authenticate exactly like the root token (Basic auth,
-any username). Hashes only in state; plaintext shown once at creation.
+Apps are identified by **(repo, branch)**. The subdomain is an attribute:
 
-### Access model
+- **subdomain given** → deploy there (conflict = 409 if another repo owns it)
+- **subdomain omitted, app exists** → redeploy in place, keeping its subdomain
+- **subdomain omitted, no app** → a random subdomain is minted (12 hex chars)
+  and returned in the response
 
-The dashboard is an exposed portal behind the plainskill.net abm gate
-(same as every user-facing page here). No Basic-auth wall in the browser:
-the page renders once you pass the gate, you paste an API token into the
-"access" panel (stored in localStorage) and the UI authenticates its own
-API calls with it. Token management lives in that same panel.
-
-At the Caddy layer the shipd vhosts abm-gate everything EXCEPT /api/*,
-/check and /healthz — those stay token-authed for curl/CI use.
-At the shipd layer, GET / serves the static page; every /api/* and
-state-changing path requires a token.
+Environment overrides: `SHIPD_SERVER`, `SHIPD_TOKEN`.
 
 ## How a deploy works
 
-1. `git clone --depth 1` (or fetch) into /data/shipd/builds/<slug>
-2. `docker build` with shipd.json/Dockerfile defaults
-3. push to localhost:5000 (local registry, best-effort)
-4. run new container on `shipd-net` under a temp name with Traefik labels
-5. HTTP health probe against the container; on failure: remove temp, old
-   version keeps serving (automatic rollback)
-6. swap: old container removed, temp promoted
+1. `git clone --depth 1` of the branch (git runs with `HOME=<data>/home`, so
+   deploy keys placed there work for `git@`/private repos)
+2. `docker build` — `shipd.json` in the repo root can override defaults
+3. the new container starts **without routing labels** and is health-probed
+   directly by IP
+4. only if the probe passes: the old container is removed, the validated image
+   is promoted under the stable name *with* routing labels
+5. probe failure = the temp container is discarded and the previous version
+   keeps serving (automatic rollback)
 
-## Layout on the host
+### `shipd.json` (optional, repo root)
 
-- binary: /usr/local/bin/shipd
-- config: /etc/shipd/config.json (0600 root)
-- data:   /data/shipd/ (state.json, builds/, logs via journald)
-- unit:   /etc/systemd/system/shipd.service
-- listens on 127.0.0.1:8900 only; Caddy fronts it at shipd.plainskill.net
+```json
+{
+  "port": 3000,
+  "dockerfile": "Dockerfile",
+  "context": ".",
+  "env": ["NODE_ENV=production", "PUBLIC_URL=https://myapp.apps.plainskill.net"]
+}
+```
 
-## Routing
+`port` falls back to the first `EXPOSE` in the Dockerfile. `context` and
+`dockerfile` are clamped inside the repo (a hostile `../..` is rejected).
+`env` is applied to the running container and re-applied on `start`.
 
-Caddy owns 80/443 (as always). For `<sub>.apps.plainskill.net` Caddy uses
-on-demand TLS with `ask` pointing at shipd `/check` (token in query). shipd
-answers OK only for provisioned app domains. Traffic path:
+## Auth model — external gating
 
-    browser -> Caddy (TLS) -> traefik (apps-routing, :81 on caddy/shipd-net) -> app container
+shipd does **not** authenticate humans. That is deliberately delegated to the
+infrastructure in front of it:
 
-## Ops notes (pscA)
+| layer | role |
+|---|---|
+| **authgate** (`plainskill-dash:4181 /verify`, a Caddy `forward_auth`) | **the actual authentication** — the browser session gate for the dashboard and every gated host |
+| **abm** (`abm:4191 /check`, a Caddy `forward_auth`) | **anti-bot only** — proof-of-work challenge for suspicious clients. Not authentication. Applied to *all* hosts, including deployed apps |
+| **API tokens** | **programmatic access only** — `curl`, CI, the CLI. `Authorization: Basic` with any username, token as the password |
 
-- shipd-net is a fixed-subnet bridge (172.16.0.0/24, gateway 172.16.0.1);
-  shipd additionally listens on the gateway IP so containerized Caddy can
-  reach the host process. UFW allows only shipd-net -> 8900.
-- The Caddy `ask` URL embeds the derived ask token (sha256("shipd-ask:"+api_token)
-  truncated to 32 hex) — rotate api_token in /etc/shipd/config.json AND the
-  ask URL in the Caddyfile together.
-- systemd unit hardening: ProtectSystem=strict, ProtectHome=tmpfs (shipd sets
-  HOME=/data/shipd/home for docker buildx), no caps, docker via SupplementaryGroups.
+Consequences worth knowing:
+
+- `/api/*`, `/check` and `/healthz` bypass the authgate so token-authed
+  tooling (and Caddy's own on-demand TLS ask) can reach them.
+- The dashboard paths (`/dash/*`) are unauthenticated *at the shipd layer* —
+  they rely on the authgate. Because app containers share the `shipd-net`
+  network and can reach the gateway IP directly, those paths additionally
+  require a `X-Shipd-Gate` header that only Caddy knows (derived from the API
+  token). A deployed app cannot mint tokens or delete apps.
+- Tokens are unscoped: any valid token is equivalent to root. Revoking deletes
+  it outright.
+
+## Deploying and updating shipd itself
+
+The **local registry is the update channel**. shipd runs as a host systemd
+service (it needs the docker CLI and a real `HOME` for git), and the registry
+image is the artifact carrier:
+
+```sh
+make deploy            # build on pscA → push to localhost:5000 → update service
+make deploy v1.3.0     # explicit version
+make dist              # cross-compiled CLI binaries + SHA256SUMS
+```
+
+On the host, `/stack/compose/shipd/update.sh` pulls
+`localhost:5000/atlas/shipd:latest`, extracts the binary from the image, swaps
+it into `/usr/local/bin/shipd`, restarts, health-checks, and **rolls back
+automatically** if the service does not come up. A weekly systemd timer
+(`shipd-update.timer`, Mon 04:30) runs it unattended; run it by hand with
+`sudo /stack/compose/shipd/update.sh`.
+
+## API
+
+Basic auth, any username, token as password. All JSON.
+
+| method | path | notes |
+|---|---|---|
+| POST | `/api/deploy` | `{repo, branch, subdomain?}` → 202 |
+| POST | `/api/delete` | `{repo, branch}` → deletes by identity |
+| GET | `/api/apps` | list deployments |
+| POST | `/api/apps/{sub}/{stop,start,redeploy,delete}` | act on one app |
+| GET | `/api/apps/{sub}/logs?lines=200` | container logs (clamped 1–5000) |
+| GET | `/api/whoami` | `{name, id}` for the presented token |
+| GET/POST | `/api/tokens` | list / create (`{name}` → plaintext shown once) |
+| POST | `/api/tokens/{id}/revoke` | delete a token |
+| GET | `/healthz` | liveness + version (no auth) |
+| GET | `/check?domain=&t=` | Caddy on-demand TLS gate |
+
+```sh
+curl -u shipd:$TOKEN -H 'Content-Type: application/json' \
+  -d '{"repo":"https://gt.plainskill.net/plainskill/shipd-example.git","branch":"main"}' \
+  https://your-shipd-host/api/deploy
+```
+
+## Ops
+
+| what | where |
+|---|---|
+| binary | `/usr/local/bin/shipd` |
+| config | `/etc/shipd/config.json` (0640 root:plainskill — holds `api_token`) |
+| state | `/data/shipd/state.json` (apps + tokens, 0600) |
+| builds | `/data/shipd/builds/<slug>-<hash8>` |
+| git HOME | `/data/shipd/home` (deploy keys go in `.ssh/` here) |
+| unit | `/etc/systemd/system/shipd.service` (ProtectSystem=strict, no caps, docker via SupplementaryGroups) |
+| listens | `127.0.0.1:8900` + `172.16.0.1:8900` (shipd-net gateway, for Caddy) |
+| app network | `shipd-net` (172.16.0.0/24) — app containers live here |
+| routing | Caddy (80/443, TLS) → Traefik `shipd-router:81` (label discovery) → app |
+| firewall | UFW allows 8900 only from `172.16.0.0/24` |
+
+Secrets derived from `api_token`: the ask token (`sha256("shipd-ask:"+token)`)
+and the dashboard gate token (`sha256("shipd-gate:"+token)`). Rotating the API
+token requires updating the Caddy `ask` URL and `X-Shipd-Gate` header to match.
+
+## Repo layout
+
+```
+main.go config.go state.go engine.go http.go tokens.go dash.go   server (package main)
+cli/main.go                                                      the shipd CLI
+dashboard.html                                                   embedded dashboard UI
+deploy/                                                          update.sh + systemd units
+Dockerfile                                                       artifact image (registry channel)
+install.sh                                                       one-line CLI installer
+Makefile                                                         build / dist / image / deploy
+```
