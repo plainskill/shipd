@@ -91,7 +91,7 @@ function api(path, opts) {
   opts.headers = Object.assign({}, opts.headers || {});
   return fetch(path, opts);
 }
-function esc(s) { return (s || "").replace(/[&<>"]/g, function(c) {
+function esc(s) { return (s || "").replace(/[&<>"']/g, function(c) {
   return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
 });}
 function shortRepo(u) { return u.replace(/^https?:\/\//, "").replace(/^git@/, "").replace(/\.git$/, ""); }

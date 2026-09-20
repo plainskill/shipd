@@ -16,6 +16,7 @@ check-dash: ## extract the embedded dashboard script and syntax-check it
 	@command -v node >/dev/null 2>&1 || { echo "check-dash: node not installed, skipping"; exit 0; }
 	@python3 -c "import re,sys; s=open('dashboard.html').read(); m=re.search(r'<script>(.*?)</script>', s, re.S); open('/tmp/shipd-dash.js','w').write(m.group(1))"
 	@node --check /tmp/shipd-dash.js && echo "check-dash: JS syntax ok"
+	@node dash.test.js dashboard.html
 
 build: ## build the server binary for this host
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $(DIST)/shipd .
