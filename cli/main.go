@@ -722,6 +722,10 @@ func cmdLogs(args []string) {
 	if code != http.StatusOK {
 		die("logs failed (%d): %s", code, apiErr(body))
 	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		fmt.Println("(no log output — the container has not written to stdout)")
+		return
+	}
 	fmt.Print(string(body))
 }
 
