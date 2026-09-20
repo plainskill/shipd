@@ -42,8 +42,8 @@ global.setInterval = () => 0;
 global.encodeURIComponent = encodeURIComponent;
 
 const APPS = [{
-  repo: "https://gt.plainskill.net/plainskill/demo.git", branch: "main",
-  subdomain: "hello", domain: "hello.apps.plainskill.net", status: "running",
+  repo: "https://forge.example.net/someone/demo.git", branch: "main",
+  subdomain: "hello", domain: "hello.apps.example.net", status: "running",
   git_sha: "abc1234", desired_up: true,
 }];
 // a genuinely hostile token name: apostrophe, double quote, angle brackets
@@ -53,8 +53,13 @@ const TOKENS = [{
 
 const fetchCalls = [];
 global.fetch = async (path, opts) => {
+  const p = String(path);
   fetchCalls.push((opts && opts.method) || "GET");
-  const body = String(path).includes("tokens") && !String(path).includes("revoke") ? TOKENS : APPS;
+  if (p.includes("/dash/config")) {
+    const cfg = { domain: "apps.example.net", version: "test" };
+    return { status: 200, ok: true, json: async () => cfg, text: async () => JSON.stringify(cfg) };
+  }
+  const body = p.includes("tokens") && !p.includes("revoke") ? TOKENS : APPS;
   return { status: 200, ok: true, json: async () => body, text: async () => JSON.stringify(body) };
 };
 
@@ -67,7 +72,7 @@ setTimeout(() => {
   const fails = [];
   const check = (cond, msg) => { if (!cond) fails.push(msg); };
 
-  check(apps.includes("hello.apps.plainskill.net"), "apps panel did not render the app");
+  check(apps.includes("hello.apps.example.net"), "apps panel did not render the app");
   check(apps.includes('data-act="redeploy"'), "apps panel missing redeploy button");
   check(apps.includes('data-act="delete"'), "apps panel missing delete button");
   check(!apps.includes("onclick="), "apps panel still uses inline onclick");
@@ -77,6 +82,9 @@ setTimeout(() => {
   check(!toks.includes("<x>"), "token name was not escaped in the markup");
   check(toks.includes("&#39;") && toks.includes("&quot;"), "token name was not properly entity-escaped");
   check(apps.trim() !== "loading..." && apps.trim() !== "", "apps panel still shows loading state");
+  check(get("zone").textContent === "apps.example.net", "zone was not painted from /dash/config");
+  check(!apps.includes("plainskill.net"), "apps panel contains a hardcoded deployment hostname");
+  check(fetchCalls.includes("GET") && fetchCalls.length >= 3, "expected config + apps + tokens fetches");
   check(toks.trim() !== "loading..." && toks.trim() !== "", "tokens panel still shows loading state");
 
   console.log("fetch calls:", fetchCalls.join(","));

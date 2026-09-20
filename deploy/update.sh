@@ -6,6 +6,11 @@
 #
 # Runs on pscA as root:  sudo /stack/compose/shipd/update.sh [image]
 #
+# TRUST: this executes the pulled binary (to read its version) as root, and the
+# weekly timer points at :latest — so anything that can push to the registry
+# effectively runs as root here, unattended. Pushing requires docker access,
+# which is already root-equivalent; keep the registry access list short.
+#
 set -euo pipefail
 
 IMAGE="${1:-localhost:5000/atlas/shipd:latest}"
@@ -15,7 +20,8 @@ HEALTH=http://127.0.0.1:8900/healthz
 log() { printf '[shipd-update] %s\n' "$*"; }
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+CID=""
+trap '[ -n "$CID" ] && docker rm -f "$CID" >/dev/null 2>&1; rm -rf "$TMP"' EXIT
 
 log "pulling $IMAGE"
 docker pull "$IMAGE" >/dev/null
@@ -38,8 +44,8 @@ cp -p "$BIN" "$TMP/shipd.rollback" 2>/dev/null || true
 install -m 0755 "$TMP/shipd" "$BIN"
 systemctl restart shipd
 
-for i in $(seq 1 10); do
-  sleep 1
+for i in $(seq 1 20); do
+  sleep 1.5
   if curl -fsS "$HEALTH" >/dev/null 2>&1; then
     log "updated to $NEW"
     exit 0

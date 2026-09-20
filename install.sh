@@ -60,7 +60,7 @@ else
   got=$(shasum -a 256 "$tmp/$asset" | awk '{print $1}')
 fi
 [ "$want" = "$got" ] || die "checksum mismatch for $asset (want $want, got $got)"
-say "checksum ok"
+say "checksum ok (integrity only — the manifest comes from the same origin, not a signature)"
 
 # --- install ----------------------------------------------------------
 mkdir -p "$BIN_DIR"

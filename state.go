@@ -24,19 +24,22 @@ const (
 
 // App is one deployed application, identified by repo+branch.
 type App struct {
-	Repo       string    `json:"repo"`
-	Branch     string    `json:"branch"`
-	Subdomain  string    `json:"subdomain"`
-	Domain     string    `json:"domain"`
-	Image      string    `json:"image"`
-	Port       int       `json:"port"`
-	Status     string    `json:"status"`
-	DesiredUp  bool      `json:"desired_up"`
-	Container  string    `json:"container,omitempty"`
-	GitSHA     string    `json:"git_sha,omitempty"`
-	LastError  string    `json:"last_error,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
-	LastDeploy time.Time `json:"last_deploy"`
+	Repo      string `json:"repo"`
+	Branch    string `json:"branch"`
+	Subdomain string `json:"subdomain"`
+	Domain    string `json:"domain"`
+	Image     string `json:"image"`
+	Port      int    `json:"port"`
+	Status    string `json:"status"`
+	DesiredUp bool   `json:"desired_up"`
+	Container string `json:"container,omitempty"`
+	GitSHA    string `json:"git_sha,omitempty"`
+	// Env holds per-app environment set at deploy time (shipd deploy --env).
+	// Kept out of the repo on purpose so secrets never land in git.
+	Env        map[string]string `json:"env,omitempty"`
+	LastError  string            `json:"last_error,omitempty"`
+	CreatedAt  time.Time         `json:"created_at"`
+	LastDeploy time.Time         `json:"last_deploy"`
 }
 
 // TokenRecord is a managed API token persisted in state.

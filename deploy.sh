@@ -1,44 +1,55 @@
 #!/usr/bin/env bash
 #
-# Build shipd on pscA, push the artifact image to the local registry, then
-# update the running service from that image.
+# Build shipd on the build host, push the artifact image to the local registry,
+# then update the running service from that image.
 #
 #   ./deploy.sh [version]
 #
+# Overridable: SHIPD_REMOTE, SHIPD_STAGE, SHIPD_IMAGE, SHIPD_HEALTH_URL.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REMOTE="${SHIPD_REMOTE:-pscA}"
 STAGE="${SHIPD_STAGE:-/tmp/shipd-build}"
 IMAGE="${SHIPD_IMAGE:-localhost:5000/atlas/shipd}"
+UPDATE="${SHIPD_UPDATE:-/stack/compose/shipd/update.sh}"
+HEALTH_URL="${SHIPD_HEALTH_URL:-https://apps.plainskill.net/healthz}"
 VERSION="${1:-$(cd "$ROOT" && git describe --tags --always --dirty 2>/dev/null || echo dev)}"
 
 info() { printf '[deploy] %s\n' "$*"; }
 err()  { printf '[deploy] ERROR: %s\n' "$*" >&2; }
 
-info "version: $VERSION"
+info "version: $VERSION  remote: $REMOTE"
 
-# --- stage source on the build host -----------------------------------
+# --- stage the module source on the build host (whole tree: future
+# --- subpackages the server imports must travel too) --------------------
 info "syncing source to $REMOTE:$STAGE ..."
-ssh "$REMOTE" "rm -rf $STAGE && mkdir -p $STAGE"
-scp -q "$ROOT"/{go.mod,Dockerfile,dashboard.html} "$REMOTE:$STAGE/"
-scp -q "$ROOT"/*.go "$REMOTE:$STAGE/"
+TARBALL="$(mktemp)"
+tar czf "$TARBALL" -C "$ROOT" --exclude=.git --exclude=dist --exclude=deploy --exclude=node_modules .
+scp -q "$TARBALL" "$REMOTE:$STAGE.tar.gz"
+rm -f "$TARBALL"
 
-# --- build + push ------------------------------------------------------
-info "building image and pushing to registry ..."
-ssh "$REMOTE" "cd $STAGE && docker build --build-arg VERSION=$VERSION -t $IMAGE:$VERSION -t $IMAGE:latest . >/dev/null && docker push $IMAGE:$VERSION >/dev/null && docker push $IMAGE:latest >/dev/null && echo pushed"
-
-# --- update the running service from the registry ----------------------
-info "updating service from the registry ..."
-ssh "$REMOTE" "sudo /stack/compose/shipd/update.sh"
+# --- build + push + update (values passed pre-quoted; script on stdin) ----
+ssh "$REMOTE" "STAGE=$(printf '%q' "$STAGE") IMAGE=$(printf '%q' "$IMAGE") VERSION=$(printf '%q' "$VERSION") UPDATE=$(printf '%q' "$UPDATE") bash -s" <<'REMOTE_SCRIPT'
+set -euo pipefail
+rm -rf "$STAGE" && mkdir -p "$STAGE"
+tar xzf "$STAGE.tar.gz" -C "$STAGE" && rm -f "$STAGE.tar.gz"
+cd "$STAGE"
+echo "[deploy] building image $IMAGE:$VERSION"
+docker build --build-arg VERSION="$VERSION" -t "$IMAGE:$VERSION" -t "$IMAGE:latest" . >/dev/null
+docker push "$IMAGE:$VERSION" >/dev/null
+docker push "$IMAGE:latest" >/dev/null
+echo "[deploy] pushed; updating service via $UPDATE"
+sudo "$UPDATE"
+REMOTE_SCRIPT
 
 # --- verify ------------------------------------------------------------
 sleep 2
-STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://apps.plainskill.net/healthz 2>/dev/null || echo 000)
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo 000)
 if [ "$STATUS" = "200" ]; then
-  info "live — healthz HTTP $STATUS"
+  info "live — $HEALTH_URL HTTP $STATUS"
 else
-  err "healthz returned $STATUS"
+  err "$HEALTH_URL returned $STATUS"
   ssh "$REMOTE" "sudo journalctl -u shipd -n 15 --no-pager" || true
   exit 1
 fi

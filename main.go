@@ -58,11 +58,13 @@ func main() {
 	mux.Handle("GET /api/tokens", eng.guard(http.HandlerFunc(eng.handleTokensList)))
 	mux.Handle("GET /api/whoami", eng.guard(http.HandlerFunc(eng.handleWhoami)))
 	mux.Handle("POST /api/delete", eng.guard(http.HandlerFunc(eng.handleDeleteByIdentity)))
+	mux.Handle("POST /api/prune", eng.guard(http.HandlerFunc(eng.handlePrune)))
 	mux.Handle("POST /api/tokens", eng.guard(http.HandlerFunc(eng.handleTokenCreate)))
 	mux.Handle("POST /api/tokens/{id}/revoke", eng.guard(http.HandlerFunc(eng.handleTokenRevoke)))
 	// dashboard endpoints: NO token auth at this layer — the abm gate at
 	// Caddy is the access control for the UI. API tokens are exclusively
 	// for programmatic deploys.
+	mux.Handle("GET /dash/config", eng.gateOnly(http.HandlerFunc(eng.handleConfig)))
 	mux.Handle("GET /dash/apps", eng.gateOnly(handleAppsList(st)))
 	mux.Handle("POST /dash/deploy", eng.gateOnly(http.HandlerFunc(eng.handleDeploy)))
 	mux.Handle("POST /dash/delete", eng.gateOnly(http.HandlerFunc(eng.handleDeleteByIdentity)))
@@ -86,7 +88,7 @@ func main() {
 	for _, s := range srvs {
 		log.Printf("shipd: listening on %s", s.Addr)
 	}
-	log.Printf("shipd: ask URL for Caddy on_demand_tls: http://172.16.0.1:8900/check?t=<redacted — see config.json>")
+	log.Printf("shipd: ask URL for the proxy on_demand_tls: http://%s/check?t=<redacted — see config.json>", cfg.AskBase())
 	log.Printf("shipd: version %s, zone %s (%d apps)", version, cfg.Domain, len(st.Apps))
 	for _, s := range srvs[1:] {
 		go func(s *http.Server) {

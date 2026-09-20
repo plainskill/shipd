@@ -6,12 +6,15 @@ database, single user.
 
 ```console
 $ shipd deploy
-no subdomain given — using hello
-deploying https://gt.plainskill.net/plainskill/shipd-example.git@main → https://hello.apps.plainskill.net
+no subdomain given — using 56131dc4488b
+deploying https://forge.example.net/me/demo.git@main → https://56131dc4488b.<zone>
   building
   running
-live at https://hello.apps.plainskill.net
+live at https://56131dc4488b.<zone>
 ```
+
+(The install one-liner below and the `Ops` section at the end describe the
+reference deployment; AGENTS.md holds the host-specific details.)
 
 ## Install the CLI
 
@@ -40,10 +43,12 @@ secret without echoing so it never lands in shell history.
 | `shipd deploy` | deploy the repo you're in |
 | `shipd deploy excalidraw` | deploy it on the `excalidraw` subdomain |
 | `shipd deploy --branch dev` | deploy another branch (a separate app) |
+| `shipd deploy --env K=V` | set per-app environment (secrets — stays out of git) |
 | `shipd delete` | remove this repo's deployment |
 | `shipd delete excalidraw` | remove a named deployment |
 | `shipd apps` | list deployments |
 | `shipd logs [subdomain]` | container logs |
+| `shipd prune` | reclaim builds + images for deleted apps |
 
 Apps are identified by **(repo, branch)**. The subdomain is an attribute:
 
@@ -78,10 +83,50 @@ Environment overrides: `SHIPD_SERVER`, `SHIPD_TOKEN`.
 ```
 
 `port` falls back to the first `EXPOSE` in the Dockerfile. `context` and
-`dockerfile` are clamped inside the repo (a hostile `../..` is rejected).
-`env` is applied to the running container and re-applied on `start`.
+`dockerfile` are clamped inside the repo (a hostile `../..` is rejected, and
+symlinks out of the repo are refused). `env` is applied to the running
+container and re-applied on `start`.
+
+### Persistent data
+
+Every app gets a host directory bind-mounted at `/data`, so a redeploy does not
+wipe state — this is what makes a SQLite app survive:
+
+```
+<data-dir>/apps/<app-key-hash>/          # the app's /data
+<data-dir>/apps/by-name/<subdomain>      # symlink, for humans
+```
+
+The storage is keyed by app identity (repo+branch), so it follows the app even
+if the subdomain changes. The directory is group-writable and the container is
+started with `--group-add <shipd's gid>`, so a container running as a non-root
+`USER` can still write to `/data` (shipd runs unprivileged and cannot chown). Deleting an app leaves its data on disk; `shipd
+prune` reports orphaned data directories but never deletes them.
+
+### Secrets
+
+Environment set with `shipd deploy --env KEY=value` (repeatable) is stored in
+shipd's state file (0600) — **not** in the repo — and layered over anything
+declared in `shipd.json`. `--env KEY=` removes a key. Values are applied to the
+container and re-applied on `start`, and are never returned by the API: the
+listing exposes key names only, so a leaked listing cannot hand over a secret.
+
+### What does not fit
+
+- **Non-HTTP apps**: the health probe expects an HTTP response on `/` before
+  promoting. A worker, bot, or cron-style script will build and then fail the
+  probe and roll back. Deploy it behind a tiny HTTP shim if you need it here.
+- **Deploys ship the remote, not the working tree**: shipd clones server-side,
+  so the code has to be pushed first. That is what makes a deploy reproducible
+  (the same commit builds the same image). For a brand-new idea that means:
+  create the repo on the forge, `git push -u origin main`, then `shipd deploy`.
+- **No buildpacks**: bring a Dockerfile.
 
 ## Auth model — external gating
+
+> This describes the reference deployment's gate services. The concept is
+> generic (put an authenticating proxy in front; shipd trusts it), the product
+> names are not — see AGENTS.md.
 
 shipd does **not** authenticate humans. That is deliberately delegated to the
 infrastructure in front of it:
@@ -115,6 +160,10 @@ make deploy            # build on pscA → push to localhost:5000 → update ser
 make deploy v1.3.0     # explicit version
 make dist              # cross-compiled CLI binaries + SHA256SUMS
 ```
+
+Anything that can push to the registry effectively executes code as root on the
+host (the updater runs the pulled binary to read its version), unattended via
+the weekly timer — keep registry write access short.
 
 On the host, `/stack/compose/shipd/update.sh` pulls
 `localhost:5000/atlas/shipd:latest`, extracts the binary from the image, swaps
@@ -157,7 +206,7 @@ curl -u shipd:$TOKEN -H 'Content-Type: application/json' \
 | git HOME | `/data/shipd/home` (deploy keys go in `.ssh/` here) |
 | unit | `/etc/systemd/system/shipd.service` (ProtectSystem=strict, no caps, docker via SupplementaryGroups) |
 | listens | `127.0.0.1:8900` + `172.16.0.1:8900` (shipd-net gateway, for Caddy) |
-| app network | `shipd-net` (172.16.0.0/24) — app containers live here |
+| app network | `shipd-net` (172.16.0.0/24) — app containers live here. **Prerequisite:** create it with that explicit subnet (`docker network create --subnet 172.16.0.0/24 --gateway 172.16.0.1 shipd-net`); a default bridge gets a random subnet and the gateway in `listen_extra` / UFW / the ask URL will not exist. shipd warns at startup if an advertised listen address is missing |
 | routing | Caddy (80/443, TLS) → Traefik `shipd-router:81` (label discovery) → app |
 | firewall | UFW allows 8900 only from `172.16.0.0/24` |
 

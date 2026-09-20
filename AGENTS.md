@@ -29,6 +29,7 @@ curl -u shipd:$TOKEN -H 'Content-Type: application/json' \
 curl -u shipd:$TOKEN -H 'Content-Type: application/json' \
   -d '{"repo":"https://gt.plainskill.net/plainskill/x.git","branch":"main"}' \
   https://<host>/api/delete          # delete by identity
+curl -u shipd:$TOKEN -X POST https://<host>/api/prune    # reclaim builds/images
 ```
 
 ## Auth model — do not confuse the two gates
@@ -55,6 +56,10 @@ App identity is **(repo, branch)**; subdomain is an attribute.
 - subdomain omitted + app exists → redeploy in place, same subdomain
 - subdomain omitted + no app → random 12-hex subdomain, returned in response
 
+Per-app env set with `--env K=V` lives in state (never the repo) and is masked
+as `env_keys` in API responses. Apps get `<data>`→`/data` bind-mounted, so
+redeploys keep SQLite state; data outlives `delete` and is never auto-removed.
+
 Pipeline: clone → build → run temp **without routing labels** → HTTP probe by
 container IP → promote (remove old, run stable with labels). A failed probe
 rolls back and the old version keeps serving. Do not "simplify" this by giving
@@ -66,11 +71,13 @@ the temp container router labels — unvalidated code would take live traffic.
 |---|---|
 | binary | `/usr/local/bin/shipd` |
 | config | `/etc/shipd/config.json` (0640 root:plainskill) |
-| state | `/data/shipd/state.json` (apps + tokens) |
+| state | `/data/shipd/state.json` (apps + tokens + per-app env) |
+| app data | `/data/shipd/apps/<app-key-hash>` → `/data` in each container (mode 0775 + `--group-add 1000`, so a non-root image USER can write); `by-name/<sub>` symlinks. `shipd prune` never deletes these. Setgid is impossible: the unit sets `RestrictSUIDSGID=true` |
 | builds | `/data/shipd/builds/` |
 | git HOME | `/data/shipd/home` (deploy keys in `.ssh/` here) |
 | unit | `systemctl {status,restart} shipd`, `journalctl -u shipd` |
-| update | `sudo /stack/compose/shipd/update.sh` (registry → binary swap + rollback) |
+| update | `sudo /stack/compose/shipd/update.sh` (registry → binary swap + rollback). **Trust:** it runs the pulled binary as root, weekly and unattended against `:latest` — registry push access ≈ root on pscA |
+| app network | `shipd-net` must keep its fixed subnet 172.16.0.0/24 (gateway 172.16.0.1). Recreating it without `--subnet/--gateway` breaks `listen_extra`, the UFW rule and the ask URL; shipd logs a warning at startup if the address is missing |
 | routing | `/stack/compose/shipd-routing/` (Traefik `shipd-router`) |
 | caddy | `/stack/compose/caddy/Caddyfile` |
 

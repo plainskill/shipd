@@ -4,13 +4,16 @@ IMAGE ?= $(REGISTRY)/atlas/shipd
 GO ?= go
 DIST ?= dist
 
-.PHONY: help vet build cli image push deploy dist release clean
+.PHONY: help vet test check-dash build cli image push deploy dist release clean
 
 help:
 	@grep -E '^[a-z-]+:.*?##' $(MAKEFILE_LIST) | sed 's/:.*##/\t/' | column -t -s "$$(printf '\t')"
 
-vet: check-dash ## run go vet + dashboard JS syntax check
+vet: check-dash test ## go vet + go test + dashboard checks
 	$(GO) vet ./...
+
+test: ## run the Go test suite
+	$(GO) test ./...
 
 check-dash: ## extract the embedded dashboard script and syntax-check it
 	@command -v node >/dev/null 2>&1 || { echo "check-dash: node not installed, skipping"; exit 0; }

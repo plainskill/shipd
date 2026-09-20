@@ -13,6 +13,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,8 +24,8 @@ const (
 	logTimeout     = 30 * time.Second
 	healthTimeout  = 45 * time.Second
 	healthInterval = 2 * time.Second
-	registryHost   = "localhost:5000"
-	shipdNetwork   = "shipd-net"
+
+	shipdNetwork = "shipd-net"
 )
 
 // Engine executes deploys and docker/git operations against the host.
@@ -131,7 +133,7 @@ func (e *Engine) Upsert(repo, branch, subdomain string) *App {
 	a.Subdomain = subdomain
 	a.Domain = subdomain + "." + e.cfg.Domain
 	// hashKey disambiguates slug-folded repos (https://x/a-b vs https://x/a/b)
-	a.Image = fmt.Sprintf("%s/shipd/%s-%s:%s", registryHost, slug(repo), hashKey(key), slug(branch))
+	a.Image = fmt.Sprintf("%s/shipd/%s-%s:%s", e.cfg.Registry, slug(repo), hashKey(key), slug(branch))
 	a.Status = StatusQueued
 	a.DesiredUp = true
 	a.LastDeploy = now
@@ -214,6 +216,111 @@ func (e *Engine) EnsureNetwork() error {
 
 // Reconcile aligns status with reality (e.g. after a host reboot) and cleans
 // up temp containers orphaned by a restart mid-deploy.
+// setEnv merges deploy-time environment into an app. An empty value deletes
+// the key. Values live in shipd's state (0600), never in the repo.
+func (e *Engine) setEnv(key string, env map[string]string) *App {
+	e.st.mu.Lock()
+	a := e.st.Apps[key]
+	if a == nil {
+		e.st.mu.Unlock()
+		return nil
+	}
+	if a.Env == nil {
+		a.Env = map[string]string{}
+	}
+	for k, v := range env {
+		if v == "" {
+			delete(a.Env, k)
+			continue
+		}
+		a.Env[k] = v
+	}
+	e.st.mu.Unlock()
+	e.st.Save()
+	return e.st.Get(key)
+}
+
+// PruneResult reports what a prune reclaimed.
+type PruneResult struct {
+	BuildDirs []string `json:"build_dirs"`
+	Images    []string `json:"images"`
+	DataDirs  []string `json:"orphan_data_dirs"` // reported, never deleted
+}
+
+// Prune removes build directories and images belonging to apps that are no
+// longer in state. Orphaned app data directories are only *reported* — app
+// data is never deleted without an explicit request.
+//
+// Images are scoped to <registry>/shipd/ so nothing else on the host can be
+// touched, and every removal is by explicit tag (never a blanket prune).
+func (e *Engine) Prune() PruneResult {
+	var res PruneResult
+	live := map[string]bool{}
+	e.st.mu.RLock()
+	for k := range e.st.Apps {
+		live[hashKey(k)] = true
+	}
+	e.st.mu.RUnlock()
+
+	// build dirs: named <slug>-<hash8>
+	entries, err := os.ReadDir(filepath.Join(e.cfg.DataDir, "builds"))
+	if err == nil {
+		for _, en := range entries {
+			name := en.Name()
+			parts := strings.Split(name, "-")
+			if len(parts) < 2 {
+				continue
+			}
+			h := parts[len(parts)-1]
+			if live[h] {
+				continue
+			}
+			p := filepath.Join(e.cfg.DataDir, "builds", name)
+			if os.RemoveAll(p) == nil {
+				res.BuildDirs = append(res.BuildDirs, name)
+			}
+		}
+	}
+
+	// images: only <registry>/shipd/* tags
+	prefix := e.cfg.Registry + "/shipd/"
+	out, _ := e.runDocker(time.Minute, "images", "--format", "{{.Repository}}:{{.Tag}}")
+	for _, img := range strings.Fields(out) {
+		if !strings.HasPrefix(img, prefix) || strings.Contains(img, "<none>") {
+			continue
+		}
+		// keep anything whose hash matches a live app, or that a container uses
+		keep := false
+		for h := range live {
+			if strings.Contains(img, "-"+h+":") {
+				keep = true
+				break
+			}
+		}
+		if keep {
+			continue
+		}
+		if _, err := e.runDocker(time.Minute, "rmi", img); err == nil {
+			res.Images = append(res.Images, img)
+		}
+	}
+
+	// orphaned data dirs (reported only)
+	dirs, err := os.ReadDir(e.cfg.AppsDir())
+	if err == nil {
+		for _, en := range dirs {
+			name := en.Name()
+			if name == "by-name" || !en.IsDir() {
+				continue
+			}
+			if !live[name] {
+				res.DataDirs = append(res.DataDirs, filepath.Join(e.cfg.AppsDir(), name))
+			}
+		}
+	}
+	return res
+}
+
 func (e *Engine) Reconcile() {
 	// orphaned temps from a mid-deploy crash
 	if out, _ := e.runDocker(30*time.Second, "ps", "-aq", "--filter", "name=shipd-new-"); out != "" {
@@ -291,12 +398,30 @@ func deckPaths(src string, deck shipdJSON) (ctxDir, dockerfile string) {
 // safeJoin joins rel onto base and reports whether the result stays inside
 // base (blocks "context": "../.." style escapes in a hostile shipd.json).
 func safeJoin(base, rel string) (string, bool) {
+	if filepath.IsAbs(rel) {
+		// filepath.Join would re-root an absolute path inside base, which is
+		// safe but wrong: a repo declaring an absolute context is confused
+		return "", false
+	}
 	p := filepath.Clean(filepath.Join(base, rel))
 	base = filepath.Clean(base)
-	if p == base || strings.HasPrefix(p, base+string(os.PathSeparator)) {
+	if p != base && !strings.HasPrefix(p, base+string(os.PathSeparator)) {
+		return "", false
+	}
+	// lexical checks miss symlinks: a repo can ship "context -> /etc" and the
+	// build would happily COPY from the resolved path
+	real, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return p, true // does not exist yet; docker will report it
+	}
+	rbase, err := filepath.EvalSymlinks(base)
+	if err != nil {
 		return p, true
 	}
-	return "", false
+	if real != rbase && !strings.HasPrefix(real, rbase+string(os.PathSeparator)) {
+		return "", false
+	}
+	return p, true
 }
 
 // checkout clones (depth 1) or updates a repo working copy at dst.
@@ -471,10 +596,42 @@ func (e *Engine) RunDeploy(key string) {
 func (e *Engine) removeAppContainers(key, keep string) {
 	out, _ := e.runDocker(30*time.Second, "ps", "-aq", "--filter", "label=shipd.app="+key)
 	for _, id := range strings.Fields(out) {
-		if id != keep {
-			e.runDocker(30*time.Second, "rm", "-f", id)
+		// ps returns IDs, keep is a name — resolve before comparing, or the
+		// keep parameter silently keeps nothing
+		if keep != "" && e.containerName(id) == keep {
+			continue
 		}
+		e.runDocker(30*time.Second, "rm", "-f", id)
 	}
+}
+
+// linkAppDataName maintains <apps>/by-name/<subdomain> -> <apps>/<hash> so the
+// data dir is findable by name while the storage stays keyed by app identity
+// (which survives subdomain changes).
+func (e *Engine) linkAppDataName(app *App) error {
+	byName := filepath.Join(e.cfg.AppsDir(), "by-name")
+	if err := os.MkdirAll(byName, 0o755); err != nil {
+		return fmt.Errorf("create by-name dir: %w", err)
+	}
+	link := filepath.Join(byName, app.Subdomain)
+	target := e.cfg.AppDataDir(app.Key())
+	if cur, err := os.Readlink(link); err == nil && cur == target {
+		return nil
+	}
+	_ = os.Remove(link)
+	if err := os.Symlink(target, link); err != nil {
+		return fmt.Errorf("link app data %s: %w", app.Subdomain, err)
+	}
+	return nil
+}
+
+// containerName resolves a container ID to its name, without the leading slash.
+func (e *Engine) containerName(id string) string {
+	out, err := e.runDocker(15*time.Second, "inspect", "--format", "{{.Name}}", id)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimPrefix(strings.TrimSpace(out), "/")
 }
 
 // waitHealthy probes http://<ip>:<port>/ until it answers or timeout.
@@ -587,12 +744,60 @@ func (e *Engine) RunStart(key string) {
 
 // runContainer starts the stable-named container for an app with the full
 // routing + env + port label set (used by deploy promotion and start).
+// mergeEnv layers deploy-time env (app.Env, from `shipd deploy --env`) over
+// repo-declared env (shipd.json). Deploy-time values win.
+func mergeEnv(repoEnv []string, appEnv map[string]string) []string {
+	if len(appEnv) == 0 {
+		return repoEnv
+	}
+	ordered := append([]string{}, repoEnv...)
+	idx := map[string]int{}
+	for i, kv := range ordered {
+		if k, _, ok := strings.Cut(kv, "="); ok {
+			idx[k] = i
+		}
+	}
+	keys := make([]string, 0, len(appEnv))
+	for k := range appEnv {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if i, ok := idx[k]; ok {
+			ordered[i] = k + "=" + appEnv[k]
+			continue
+		}
+		ordered = append(ordered, k+"="+appEnv[k])
+	}
+	return ordered
+}
+
 func (e *Engine) runContainer(app *App, image string, port int, env []string) error {
-	// a stopped/exited container still owns the name — clear it first
-	_, _ = e.runDocker(time.Minute, "rm", "-f", app.containerName())
+	// per-app persistent storage: host dir -> /data, created if missing.
+	// It must be writable by the user the image actually runs as, or the
+	// volume is decoration: a container running as uid 10007 cannot write to
+	// a dir owned by the host user.
+	dataDir := e.cfg.AppDataDir(app.Key())
+	if err := os.MkdirAll(dataDir, 0o775); err != nil {
+		return fmt.Errorf("create app data dir: %w", err)
+	}
+	// shipd runs unprivileged (and the unit sets RestrictSUIDSGID), so it
+	// cannot chown the dir to the image's user, nor set the setgid bit.
+	// Group-writability + --group-add is what makes /data usable: whoever the
+	// image runs as joins shipd's group and can write. Files the container
+	// creates keep the container's own uid, so host-side management is via the
+	// directory (shipd owns it) rather than individual file ownership.
+	if err := os.Chmod(dataDir, 0o775); err != nil {
+		log.Printf("shipd: chmod app data dir: %v", err)
+	}
+	dataGID := strconv.Itoa(os.Getgid())
+
+	env = mergeEnv(env, app.Env)
 	runArgs := []string{
 		"run", "-d", "--name", app.containerName(),
 		"--network", shipdNetwork,
+		"--volume", dataDir + ":/data",
+		"--group-add", dataGID,
 		"--restart", "unless-stopped",
 		"--label", "shipd.app=" + app.Key(),
 		"--label", "shipd.subdomain=" + app.Subdomain,

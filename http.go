@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // gateOnly requires the Caddy-injected shared secret on the dashboard paths.
@@ -60,12 +61,49 @@ func httpError(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
 }
 
+// appView is the wire form of an app: env *values* are never exposed, only
+// key names, so a listing cannot hand over secrets.
+type appView struct {
+	Repo       string    `json:"repo"`
+	Branch     string    `json:"branch"`
+	Subdomain  string    `json:"subdomain"`
+	Domain     string    `json:"domain"`
+	Image      string    `json:"image,omitempty"`
+	Port       int       `json:"port,omitempty"`
+	Status     string    `json:"status"`
+	DesiredUp  bool      `json:"desired_up"`
+	GitSHA     string    `json:"git_sha,omitempty"`
+	LastError  string    `json:"last_error,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	LastDeploy time.Time `json:"last_deploy"`
+	EnvKeys    []string  `json:"env_keys,omitempty"`
+}
+
+func viewApp(a *App) appView {
+	var keys []string
+	for k := range a.Env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return appView{
+		Repo: a.Repo, Branch: a.Branch, Subdomain: a.Subdomain, Domain: a.Domain,
+		Image: a.Image, Port: a.Port, Status: a.Status, DesiredUp: a.DesiredUp,
+		GitSHA: a.GitSHA, LastError: a.LastError, CreatedAt: a.CreatedAt,
+		LastDeploy: a.LastDeploy, EnvKeys: keys,
+	}
+}
+
+// handlePrune reclaims build dirs and images for apps that no longer exist.
+func (e *Engine) handlePrune(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, e.Prune())
+}
+
 func handleAppsList(st *State) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		st.mu.RLock()
-		out := make([]App, 0, len(st.Apps))
+		out := make([]appView, 0, len(st.Apps))
 		for _, a := range st.Apps {
-			out = append(out, *a)
+			out = append(out, viewApp(a))
 		}
 		st.mu.RUnlock()
 		// stable order for the dashboard's 5s poll
@@ -78,6 +116,9 @@ type deployRequest struct {
 	Repo      string `json:"repo"`
 	Branch    string `json:"branch"`
 	Subdomain string `json:"subdomain"`
+	// Env is per-app environment stored in shipd's state (never in the repo),
+	// so secrets stay out of git. An empty value removes the key.
+	Env map[string]string `json:"env,omitempty"`
 }
 
 func (e *Engine) handleDeploy(w http.ResponseWriter, r *http.Request) {
@@ -129,6 +170,9 @@ func (e *Engine) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	app := e.Upsert(req.Repo, req.Branch, sub)
+	if len(req.Env) > 0 {
+		app = e.setEnv(app.Key(), req.Env)
+	}
 	go e.RunDeploy(app.Key())
 	writeJSON(w, http.StatusAccepted, map[string]any{"app": app, "message": "deployment queued"})
 }
@@ -190,6 +234,15 @@ func (e *Engine) handleAction(act action) http.HandlerFunc {
 
 type createTokenRequest struct {
 	Name string `json:"name"`
+}
+
+// handleConfig reports the deployment's zone (and version) so the dashboard
+// can render it instead of hardcoding a hostname.
+func (e *Engine) handleConfig(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{
+		"domain":  e.cfg.Domain,
+		"version": version,
+	})
 }
 
 // handleWhoami reports which token authenticated the request, so the CLI can

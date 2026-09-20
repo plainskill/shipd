@@ -47,7 +47,7 @@
 <body>
 <div class="col">
   <h1>shipd</h1>
-  <div class="body">git in, containers out. deploys land at &lt;name&gt;.apps.plainskill.net with automatic TLS.</div>
+  <div class="body">git in, containers out. deploys land at &lt;name&gt;.<span id="zone">…</span> with automatic TLS.</div>
 
   <div class="label">deploy</div>
   <div class="panel">
@@ -99,7 +99,12 @@ function fmtDate(iso) { try { return new Date(iso).toLocaleString(); } catch (e)
 function badge(status) { return '<span class="badge b-' + esc(status) + '">' + esc(status) + '</span>'; }
 
 function loadApps() {
-  api("/dash/apps").then(function(r) {
+  // zone from the server, never hardcoded
+api("/dash/config").then(function(r) { return r.ok ? r.json() : null; }).then(function(c) {
+  if (c && c.domain) document.getElementById("zone").textContent = c.domain;
+}).catch(function() {});
+
+api("/dash/apps").then(function(r) {
     if (r.status === 401) { return null; }
     return r.json();
   }).then(function(apps) {

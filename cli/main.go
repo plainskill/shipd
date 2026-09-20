@@ -3,7 +3,7 @@
 // shipd is host-agnostic: the server URL is chosen at login time and stored
 // with the token, so nothing here is hardcoded to a particular deployment.
 //
-//	shipd login [token]                           connect to a shipd server
+//	shipd login                                   connect to a shipd server
 //	shipd deploy [subdomain]                      deploy the repo you're in
 //	shipd delete [subdomain]                      remove a deployment
 //	shipd apps                                    list deployments
@@ -13,6 +13,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -29,15 +31,16 @@ var version = "dev"
 
 // app mirrors the server's App record (only the fields the CLI shows).
 type app struct {
-	Repo       string `json:"repo"`
-	Branch     string `json:"branch"`
-	Subdomain  string `json:"subdomain"`
-	Domain     string `json:"domain"`
-	Status     string `json:"status"`
-	GitSHA     string `json:"git_sha"`
-	LastError  string `json:"last_error"`
-	DesiredUp  bool   `json:"desired_up"`
-	LastDeploy string `json:"last_deploy"`
+	Repo       string   `json:"repo"`
+	Branch     string   `json:"branch"`
+	Subdomain  string   `json:"subdomain"`
+	Domain     string   `json:"domain"`
+	Status     string   `json:"status"`
+	GitSHA     string   `json:"git_sha"`
+	LastError  string   `json:"last_error"`
+	DesiredUp  bool     `json:"desired_up"`
+	LastDeploy string   `json:"last_deploy"`
+	EnvKeys    []string `json:"env_keys"`
 }
 
 // ---- client config (~/.config/shipd/config.json, 0600) ---------------
@@ -117,6 +120,8 @@ func main() {
 		cmdDelete(args[1:])
 	case "apps", "ls", "list":
 		cmdApps()
+	case "prune":
+		cmdPrune()
 	case "logs":
 		cmdLogs(args[1:])
 	case "login":
@@ -140,12 +145,12 @@ func usage() {
 	fmt.Print(`shipd — deploy git repos to a shipd server
 
 usage:
-  shipd login [token]
+  shipd login
         connect to a shipd server: asks for the url (defaults to the stored
         one) and the token, verifies it, and stores both in
         ~/.config/shipd/config.json
 
-  shipd deploy [subdomain] [--branch <b>] [--repo <url>]
+  shipd deploy [subdomain] [--branch <b>] [--repo <url>] [--env K=V ...]
         deploy the repo in the current directory. with no subdomain:
         redeploys in place if this repo+branch already exists, otherwise
         picks a random subdomain (printed in the response).
@@ -154,6 +159,7 @@ usage:
         remove this repo's deployment (or the named one).
 
   shipd apps                    list deployments
+  shipd prune                   reclaim builds/images for deleted apps
   shipd logs [subdomain]        container logs (last 200 lines)
   shipd whoami                  show the server and token in use
   shipd logout                  forget the stored token
@@ -173,16 +179,18 @@ func promptToken(label string) string {
 	fmt.Fprintf(os.Stderr, "%s: ", label)
 	off := exec.Command("stty", "-echo")
 	off.Stdin = os.Stdin
-	echoOff := off.Run() == nil
-	var line string
-	_, err := fmt.Fscanln(os.Stdin, &line)
-	if echoOff {
-		on := exec.Command("stty", "echo")
-		on.Stdin = os.Stdin
-		_ = on.Run()
-		fmt.Fprintln(os.Stderr)
+	if off.Run() == nil {
+		defer func() {
+			on := exec.Command("stty", "echo")
+			on.Stdin = os.Stdin
+			_ = on.Run()
+			fmt.Fprintln(os.Stderr)
+		}()
+	} else {
+		fmt.Fprintln(os.Stderr, "(warning: cannot disable terminal echo here — input will be visible)")
 	}
-	if err != nil {
+	var line string
+	if _, err := fmt.Fscanln(os.Stdin, &line); err != nil {
 		die("could not read input: %v", err)
 	}
 	return strings.TrimSpace(line)
@@ -228,16 +236,22 @@ func gitOut(args ...string) (string, error) {
 func repoURL() (string, error) {
 	raw, err := gitOut("remote", "get-url", "origin")
 	if err != nil {
-		return "", errors.New("not a git repo with an 'origin' remote (use --repo)")
+		return "", errors.New("no 'origin' remote here — shipd clones the repo server-side, so the code has to exist on a forge first:\n" +
+			"  git remote add origin <git url>   # or create the repo on your forge, then\n" +
+			"  git push -u origin HEAD\n" +
+			"then re-run shipd deploy (or pass --repo <url> --branch <branch>)")
 	}
 	return normalizeRemote(raw), nil
 }
 
 func normalizeRemote(raw string) string {
 	raw = strings.TrimSpace(raw)
+	// the server trims a trailing .git when storing Repo, so trim it here too —
+	// otherwise `shipd logs` can never match a standard remote
+	trimmed := strings.TrimSuffix(raw, ".git")
 	switch {
 	case strings.HasPrefix(raw, "https://"), strings.HasPrefix(raw, "http://"):
-		return raw
+		return trimmed
 	case strings.HasPrefix(raw, "ssh://"):
 		rest := strings.TrimPrefix(raw, "ssh://")
 		rest = strings.TrimPrefix(rest, "git@")
@@ -248,14 +262,14 @@ func normalizeRemote(raw string) string {
 		if i := strings.Index(host, ":"); i >= 0 {
 			host = host[:i]
 		}
-		return "https://" + host + "/" + path
+		return "https://" + host + "/" + strings.TrimSuffix(path, ".git")
 	case strings.HasPrefix(raw, "git@"):
 		rest := strings.TrimPrefix(raw, "git@")
 		host, path, ok := strings.Cut(rest, ":")
 		if !ok {
 			return raw
 		}
-		return "https://" + host + "/" + path
+		return "https://" + host + "/" + strings.TrimSuffix(path, ".git")
 	}
 	return raw
 }
@@ -274,6 +288,10 @@ func currentBranch() (string, error) {
 // ---- api --------------------------------------------------------------
 
 func api(method, path string, body any) (int, []byte, error) {
+	return apiLimit(method, path, body, 8<<20)
+}
+
+func apiLimit(method, path string, body any, limit int64) (int, []byte, error) {
 	srv, err := server()
 	if err != nil {
 		return 0, nil, err
@@ -303,38 +321,12 @@ func api(method, path string, body any) (int, []byte, error) {
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
-	out, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	out, _ := io.ReadAll(io.LimitReader(resp.Body, limit))
 	return resp.StatusCode, out, nil
 }
 
 func basicAuth(user, pass string) string {
-	const table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	src := []byte(user + ":" + pass)
-	var b strings.Builder
-	for i := 0; i < len(src); i += 3 {
-		var n uint32
-		rem := len(src) - i
-		n = uint32(src[i]) << 16
-		if rem > 1 {
-			n |= uint32(src[i+1]) << 8
-		}
-		if rem > 2 {
-			n |= uint32(src[i+2])
-		}
-		b.WriteByte(table[(n>>18)&63])
-		b.WriteByte(table[(n>>12)&63])
-		if rem > 1 {
-			b.WriteByte(table[(n>>6)&63])
-		} else {
-			b.WriteByte('=')
-		}
-		if rem > 2 {
-			b.WriteByte(table[n&63])
-		} else {
-			b.WriteByte('=')
-		}
-	}
-	return b.String()
+	return base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
 }
 
 func die(format string, a ...any) {
@@ -345,13 +337,10 @@ func die(format string, a ...any) {
 // ---- commands ---------------------------------------------------------
 
 func cmdLogin(args []string) {
-	var tok string
-	for _, a := range args {
-		if strings.HasPrefix(a, "-") {
-			die("unknown flag %q (login takes an optional token only)", a)
-		}
-		tok = a
+	if len(args) > 0 {
+		die("`shipd login` takes no arguments — it prompts for the server url and token (use SHIPD_TOKEN for automation)")
 	}
+	var tok string
 
 	// the server is chosen interactively: env override, then prompt
 	srv := strings.TrimSpace(os.Getenv("SHIPD_SERVER"))
@@ -438,8 +427,22 @@ func cmdWhoami() {
 
 func cmdDeploy(args []string) {
 	var subdomain, branch, repo string
+	var env map[string]string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
+		case "--env", "-e":
+			if i+1 >= len(args) {
+				die("--env needs KEY=value")
+			}
+			i++
+			k, v, ok := strings.Cut(args[i], "=")
+			if !ok || k == "" {
+				die("--env needs KEY=value (got %q)", args[i])
+			}
+			if env == nil {
+				env = map[string]string{}
+			}
+			env[k] = v
 		case "--branch", "-b":
 			if i+1 >= len(args) {
 				die("--branch needs a value")
@@ -477,9 +480,21 @@ func cmdDeploy(args []string) {
 		}
 	}
 
-	code, body, err := api("POST", "/api/deploy", map[string]string{
-		"repo": repo, "branch": branch, "subdomain": subdomain,
-	})
+	payload := map[string]any{"repo": repo, "branch": branch, "subdomain": subdomain}
+	if len(env) > 0 {
+		payload["env"] = env
+		keys := make([]string, 0, len(env))
+		for k, v := range env {
+			if v == "" {
+				keys = append(keys, k+" (cleared)")
+			} else {
+				keys = append(keys, k)
+			}
+		}
+		sort.Strings(keys)
+		fmt.Printf("env: %s\n", strings.Join(keys, ", "))
+	}
+	code, body, err := api("POST", "/api/deploy", payload)
 	if err != nil {
 		die("%v", err)
 	}
@@ -603,6 +618,36 @@ func cmdDelete(args []string) {
 	fmt.Printf("deleted %s (%s@%s)\n", resp.Deleted, repo, branch)
 }
 
+// cmdPrune reclaims build dirs and images for apps that no longer exist.
+// App data directories are only reported — data is never deleted implicitly.
+func cmdPrune() {
+	code, body, err := api("POST", "/api/prune", map[string]string{})
+	if err != nil {
+		die("%v", err)
+	}
+	if code != http.StatusOK {
+		die("prune failed (%d): %s", code, apiErr(body))
+	}
+	var res struct {
+		BuildDirs []string `json:"build_dirs"`
+		Images    []string `json:"images"`
+		DataDirs  []string `json:"orphan_data_dirs"`
+	}
+	if err := json.Unmarshal(body, &res); err != nil {
+		die("bad response: %v", err)
+	}
+	fmt.Printf("removed %d build dir(s), %d image(s)\n", len(res.BuildDirs), len(res.Images))
+	for _, i := range res.Images {
+		fmt.Printf("  image  %s\n", i)
+	}
+	if len(res.DataDirs) > 0 {
+		fmt.Printf("orphaned app data (kept — delete by hand if unwanted):\n")
+		for _, d := range res.DataDirs {
+			fmt.Printf("  data   %s\n", d)
+		}
+	}
+}
+
 func cmdApps() {
 	code, body, err := api("GET", "/api/apps", nil)
 	if err != nil {
@@ -622,6 +667,9 @@ func cmdApps() {
 	for _, a := range apps {
 		fmt.Printf("%-24s %-10s https://%s\n", a.Subdomain, a.Status, a.Domain)
 		fmt.Printf("%-24s %s@%s %s\n", "", shortRepo(a.Repo), a.Branch, a.GitSHA)
+		if len(a.EnvKeys) > 0 {
+			fmt.Printf("%-24s env: %s\n", "", strings.Join(a.EnvKeys, ", "))
+		}
 		if a.LastError != "" {
 			fmt.Printf("%-24s error: %s\n", "", a.LastError)
 		}

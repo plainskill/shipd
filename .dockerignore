@@ -1,0 +1,9 @@
+.git
+dist
+deploy
+node_modules
+*.md
+Makefile
+install.sh
+deploy.sh
+dash.test.js

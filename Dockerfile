@@ -7,9 +7,8 @@
 FROM golang:1.24-alpine AS build
 ARG VERSION=dev
 WORKDIR /src
-COPY go.mod ./
-COPY *.go ./
-COPY dashboard.html ./
+# whole module (see .dockerignore) so subpackages the server imports are included
+COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/shipd .
 
 FROM scratch

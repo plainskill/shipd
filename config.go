@@ -23,7 +23,14 @@ type Config struct {
 	// the dashboard paths require the Caddy-injected X-Shipd-Gate header.
 	ListenExtra []string `json:"listen_extra"`
 
-	Domain   string `json:"domain"` // e.g. apps.plainskill.net
+	// Domain is the app zone (default is this deployment's; set it explicitly
+	// on any other host).
+	Domain string `json:"domain"`
+
+	// Registry is where built images are tagged/pushed. The push is
+	// best-effort; an unreachable registry degrades to local-only images.
+	Registry string `json:"registry"`
+
 	APIToken string `json:"api_token"`
 	DataDir  string `json:"data_dir"`
 
@@ -49,6 +56,9 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.DataDir == "" {
 		cfg.DataDir = "/data"
 	}
+	if cfg.Registry == "" {
+		cfg.Registry = "localhost:5000"
+	}
 	if cfg.APIToken == "" {
 		return nil, fmt.Errorf("api_token is required in %s", path)
 	}
@@ -70,6 +80,27 @@ func (c *Config) BuildsDir() string { return filepath.Join(c.DataDir, "builds") 
 // trimGitSuffix strips whitespace and a trailing ".git" from a repo URL.
 func trimGitSuffix(s string) string {
 	return strings.TrimSuffix(strings.TrimSpace(s), ".git")
+}
+
+// AppsDir is where per-app persistent data lives. It is bind-mounted to /data
+// inside every app container, so a redeploy does not wipe app state (SQLite
+// files, uploads, caches).
+func (c *Config) AppsDir() string { return filepath.Join(c.DataDir, "apps") }
+
+// AppDataDir returns the persistent data directory for an app key.
+func (c *Config) AppDataDir(key string) string {
+	return filepath.Join(c.AppsDir(), hashKey(key))
+}
+
+// AskBase is the address a reverse proxy should use to reach shipd for the
+// on-demand TLS ask endpoint. It prefers an explicit listen_extra address
+// (the docker bridge gateway in this deployment) and falls back to the
+// primary listen address.
+func (c *Config) AskBase() string {
+	if len(c.ListenExtra) > 0 {
+		return c.ListenExtra[0]
+	}
+	return c.Listen
 }
 
 // AskToken derives the static token Caddy presents to /check. Derived from
@@ -133,6 +164,19 @@ func validRepoURL(s string) bool {
 	if strings.HasPrefix(s, "https://") {
 		u, err := url.Parse(s)
 		return err == nil && u.Host != "" && strings.Contains(u.Path, "/") && u.User == nil
+	}
+	if strings.HasPrefix(s, "ssh://") {
+		// ssh://[user@]host[:port]/owner/repo(.git) — user (git@) and port are
+		// both normal here; a password in the URL is not
+		u, err := url.Parse(s)
+		if err != nil || u.Host == "" || !strings.Contains(u.Path, "/") {
+			return false
+		}
+		if u.User == nil {
+			return true
+		}
+		_, hasPassword := u.User.Password()
+		return !hasPassword
 	}
 	if strings.HasPrefix(s, "git@") {
 		// scp-like: git@host:owner/repo(.git) — no leading slash
