@@ -86,6 +86,9 @@ disables the entire page silently.
 - **Deploys ship the remote, not the working tree** — the clone is what makes
   deploys reproducible. `shipd deploy` with no origin prints the remedy.
 - **Non-HTTP apps** fail the probe by design; they need an HTTP shim.
+- **Only `/data` persists** across deploys (keyed by app identity — branch
+  included). State written elsewhere in the container is lost; a DB-backed app
+  must point its data path at `/data`.
 - **Edge discovery latency**: right after promotion the app container is healthy
   but the proxy may 404 until it reloads its routes. Set `edge_probe` so a deploy
   is only reported successful once the app answers through the edge.

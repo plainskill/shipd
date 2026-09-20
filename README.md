@@ -98,7 +98,14 @@ wipe state — this is what makes a SQLite app survive:
 ```
 
 The storage is keyed by app identity (repo+branch), so it follows the app even
-if the subdomain changes. The directory is group-writable and the container is
+if the subdomain changes. **Only `/data` persists** — anything the container
+writes elsewhere in its filesystem (its app directory, `/var/lib/...`, a
+database's default data path) is part of the image/container and is gone on the
+next deploy. An app that keeps state must be told to write to `/data`.
+
+Redeploys reuse the same directory, so a container is replaced but its data is
+not. `delete` leaves the data on disk; `shipd prune` reports orphaned data
+directories but never removes them. The directory is group-writable and the container is
 started with `--group-add <shipd's gid>`, so a container running as a non-root
 `USER` can still write to `/data` (shipd runs unprivileged and cannot chown). Deleting an app leaves its data on disk; `shipd
 prune` reports orphaned data directories but never deletes them.
