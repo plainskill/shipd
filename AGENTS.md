@@ -17,7 +17,7 @@ shipd whoami                     # which server + token am I using
 
 CLI config lives in `~/.config/shipd/config.json` (server + token, 0600).
 `SHIPD_SERVER` / `SHIPD_TOKEN` override it. There is no default server — shipd
-is host-agnostic; `shipd login --server <url>` sets it.
+is host-agnostic; `shipd login` asks for it.
 
 Raw API (tokens are for programmatic use):
 

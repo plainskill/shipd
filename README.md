@@ -25,7 +25,7 @@ release checksum, supports linux/darwin on amd64/arm64.
 Then connect it to a server — the CLI is host-agnostic, nothing is baked in:
 
 ```sh
-shipd login --server https://your-shipd-host     # prompts for url + token
+shipd login                    # asks for the server url, then the token
 shipd whoami                                     # which server, which token
 ```
 
@@ -143,7 +143,7 @@ Basic auth, any username, token as password. All JSON.
 ```sh
 curl -u shipd:$TOKEN -H 'Content-Type: application/json' \
   -d '{"repo":"https://gt.plainskill.net/plainskill/shipd-example.git","branch":"main"}' \
-  https://your-shipd-host/api/deploy
+  https://<your-shipd-host>/api/deploy
 ```
 
 ## Ops

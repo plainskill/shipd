@@ -72,4 +72,4 @@ case ":$PATH:" in
   *) say "NOTE: $BIN_DIR is not in PATH — add: export PATH=\"$BIN_DIR:\$PATH\"" ;;
 esac
 
-say "next: shipd login --server https://your-shipd-host"
+say "next: shipd login"

@@ -3,7 +3,7 @@
 // shipd is host-agnostic: the server URL is chosen at login time and stored
 // with the token, so nothing here is hardcoded to a particular deployment.
 //
-//	shipd login [--server https://host] [token]   connect to a shipd server
+//	shipd login [token]                           connect to a shipd server
 //	shipd deploy [subdomain]                      deploy the repo you're in
 //	shipd delete [subdomain]                      remove a deployment
 //	shipd apps                                    list deployments
@@ -91,7 +91,7 @@ func server() (string, error) {
 	if s := loadConfig().Server; s != "" {
 		return strings.TrimRight(s, "/"), nil
 	}
-	return "", errors.New("no shipd server configured — run `shipd login --server https://your-shipd`")
+	return "", errors.New("no shipd server configured — run `shipd login`")
 }
 
 func token() (string, error) {
@@ -140,9 +140,10 @@ func usage() {
 	fmt.Print(`shipd — deploy git repos to a shipd server
 
 usage:
-  shipd login [--server <url>] [token]
-        connect to a shipd server (prompts for url and token if omitted),
-        verifies the token, and stores both in ~/.config/shipd/config.json
+  shipd login [token]
+        connect to a shipd server: asks for the url (defaults to the stored
+        one) and the token, verifies it, and stores both in
+        ~/.config/shipd/config.json
 
   shipd deploy [subdomain] [--branch <b>] [--repo <url>]
         deploy the repo in the current directory. with no subdomain:
@@ -158,7 +159,7 @@ usage:
   shipd logout                  forget the stored token
   shipd version
 
-environment (override stored config):
+environment (skip the prompts / override stored config):
   SHIPD_SERVER    server base url
   SHIPD_TOKEN     API token
 `)
@@ -344,22 +345,16 @@ func die(format string, a ...any) {
 // ---- commands ---------------------------------------------------------
 
 func cmdLogin(args []string) {
-	var srv, tok string
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--server", "-s":
-			if i+1 >= len(args) {
-				die("--server needs a value")
-			}
-			i++
-			srv = args[i]
-		default:
-			if strings.HasPrefix(args[i], "-") {
-				die("unknown flag %q", args[i])
-			}
-			tok = args[i]
+	var tok string
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") {
+			die("unknown flag %q (login takes an optional token only)", a)
 		}
+		tok = a
 	}
+
+	// the server is chosen interactively: env override, then prompt
+	srv := strings.TrimSpace(os.Getenv("SHIPD_SERVER"))
 	if srv == "" {
 		srv = promptLine("shipd server url", loadConfig().Server)
 	}
