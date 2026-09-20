@@ -120,11 +120,12 @@ function loadApps() {
         + '<div class="meta">last deploy: ' + esc(a.last_deploy ? fmtDate(a.last_deploy) : "never") + '</div>'
         + '<div class="actions">'
         + '<a href="/dash/apps/' + esc(a.subdomain) + '/logs">logs</a> &nbsp; '
-        + '<button class="quiet" onclick="act(\'' + esc(a.subdomain) + '\',\'redeploy\')">redeploy</button> &nbsp; '
+        + '<a href="/dash/apps/' + encodeURIComponent(a.subdomain) + '/logs">logs</a> &nbsp; '
+        + '<button class="quiet" data-act="redeploy" data-sub="' + esc(a.subdomain) + '">redeploy</button> &nbsp; '
         + (a.desired_up
-            ? '<button class="quiet" onclick="act(\'' + esc(a.subdomain) + '\',\'stop\')">stop</button> &nbsp; '
-            : '<button class="quiet" onclick="act(\'' + esc(a.subdomain) + '\',\'start\')">start</button> &nbsp; ')
-        + '<button class="quiet warn" onclick="del(\'' + esc(a.subdomain) + '\')">delete</button>'
+            ? '<button class="quiet" data-act="stop" data-sub="' + esc(a.subdomain) + '">stop</button> &nbsp; '
+            : '<button class="quiet" data-act="start" data-sub="' + esc(a.subdomain) + '">start</button> &nbsp; ')'
+        + '<button class="quiet warn" data-act="delete" data-sub="' + esc(a.subdomain) + '">delete</button>'
         + '</div></div>';
     }
     el.innerHTML = html;
@@ -160,7 +161,7 @@ function loadTokens() {
         + '<div class="meta">created ' + esc(fmtDate(t.created_at))
         + (t.last_used_at ? ' &middot; last used ' + esc(fmtDate(t.last_used_at)) : ' &middot; never used')
         + '</div>'
-        + '<div class="actions"><button class="quiet warn" onclick="revoke(\'' + esc(t.id) + '\',\'' + esc(t.name) + '\')">revoke</button></div>'
+        + '<div class="actions"><button class="quiet warn" data-revoke="' + esc(t.id) + '" data-name="' + esc(t.name) + '">revoke</button></div>' 
         + '</div>';
     }
     el.innerHTML = html;
@@ -169,9 +170,25 @@ function loadTokens() {
 
 function revoke(id, name) {
   if (!confirm("revoke token '" + name + "'? it is deleted and anything using it stops working.")) return;
-  api("/dash/tokens/" + id + "/revoke", { method: "POST" });
+  api("/dash/tokens/" + encodeURIComponent(id) + "/revoke", { method: "POST" });
   setTimeout(loadTokens, 400);
 }
+
+// Event delegation: no inline handlers, so token names or subdomains
+// containing quotes / backslashes / HTML can never break the markup.
+document.getElementById("apps").addEventListener("click", function(ev) {
+  var btn = ev.target.closest("button[data-act]");
+  if (!btn) return;
+  var sub = btn.getAttribute("data-sub");
+  var action = btn.getAttribute("data-act");
+  if (action === "delete") { del(sub); } else { act(sub, action); }
+});
+
+document.getElementById("tokens").addEventListener("click", function(ev) {
+  var btn = ev.target.closest("button[data-revoke]");
+  if (!btn) return;
+  revoke(btn.getAttribute("data-revoke"), btn.getAttribute("data-name"));
+});
 
 document.getElementById("deploy").addEventListener("submit", function(ev) {
   ev.preventDefault();
