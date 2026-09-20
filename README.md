@@ -46,6 +46,15 @@ deploy key / credential for the URL.
 | GET    | /api/apps/{sub}/logs?lines=200    | container logs           |
 | GET    | /healthz                          | liveness (no auth)       |
 | GET    | /check?domain=...&t=TOKEN         | Caddy on-demand TLS gate |
+| GET    | /api/tokens                       | list managed tokens      |
+| POST   | /api/tokens                       | create token {name} (plaintext shown once) |
+| POST   | /api/tokens/{id}/revoke           | revoke token             |
+
+Managed tokens authenticate exactly like the root token (Basic auth,
+any username). Hashes only in state; plaintext shown once at creation.
+Manage them from the dashboard (apps.plainskill.net) — the dashboard and
+API sit behind the same abm gate as other plainskill.net portals, except
+/api/*, /check and /healthz which are token-authed for programmatic use.
 
 ## How a deploy works
 

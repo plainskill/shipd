@@ -45,6 +45,10 @@ func main() {
 	mux.Handle("POST /api/apps/{subdomain}/redeploy", eng.guard(eng.handleAction(actionRedeploy)))
 	mux.Handle("POST /api/apps/{subdomain}/delete", eng.guard(eng.handleAction(actionDelete)))
 	mux.Handle("GET /api/apps/{subdomain}/logs", eng.guard(http.HandlerFunc(eng.handleLogs)))
+	// token management (root or any active managed token)
+	mux.Handle("GET /api/tokens", eng.guard(http.HandlerFunc(eng.handleTokensList)))
+	mux.Handle("POST /api/tokens", eng.guard(http.HandlerFunc(eng.handleTokenCreate)))
+	mux.Handle("POST /api/tokens/{id}/revoke", eng.guard(http.HandlerFunc(eng.handleTokenRevoke)))
 	mux.Handle("GET /", eng.guard(http.HandlerFunc(eng.handleDashboard)))
 
 	srvs := []*http.Server{newServer(cfg.Listen, mux)}

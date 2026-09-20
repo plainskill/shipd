@@ -38,11 +38,24 @@ type App struct {
 	LastDeploy time.Time `json:"last_deploy"`
 }
 
+// TokenRecord is a managed API token persisted in state.
+type TokenRecord struct {
+	ID         string     `json:"id"`
+	Name       string     `json:"name"`
+	Hash       string     `json:"hash"`
+	CreatedAt  time.Time  `json:"created_at"`
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
+}
+
+func (t *TokenRecord) active() bool { return t.RevokedAt == nil }
+
 // State is shipd's entire persistence: one JSON file.
 type State struct {
-	mu   sync.RWMutex
-	path string
-	Apps map[string]*App `json:"apps"`
+	mu     sync.RWMutex
+	path   string
+	Apps   map[string]*App         `json:"apps"`
+	Tokens map[string]*TokenRecord `json:"tokens,omitempty"`
 }
 
 func LoadState(path string) (*State, error) {

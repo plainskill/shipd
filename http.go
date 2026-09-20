@@ -2,18 +2,28 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
+	"strings"
 )
 
-// guard enforces the shared API token via Basic auth (any username).
+// guard enforces authentication: root token from config or a managed token.
+// Uses constant-time comparison via State.CheckToken.
 func (e *Engine) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, pass, ok := r.BasicAuth()
-		if !ok || pass != e.cfg.APIToken {
+		if !ok {
 			w.Header().Set("WWW-Authenticate", `Basic realm="shipd"`)
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
+		ok, tokID := e.st.CheckToken(e.cfg.APIToken, pass)
+		if !ok {
+			w.Header().Set("WWW-Authenticate", `Basic realm="shipd"`)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		e.st.TouchToken(tokID)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -105,6 +115,52 @@ func (e *Engine) handleAction(act action) http.HandlerFunc {
 	}
 }
 
+// ---- token management endpoints ---------------------------------------
+
+type createTokenRequest struct {
+	Name string `json:"name"`
+}
+
+func (e *Engine) handleTokensList(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, e.st.ListTokens())
+}
+
+func (e *Engine) handleTokenCreate(w http.ResponseWriter, r *http.Request) {
+	var req createTokenRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" || len(req.Name) > 64 {
+		httpError(w, http.StatusBadRequest, "name required (max 64 chars)")
+		return
+	}
+	rec, plain, err := e.st.CreateToken(req.Name)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "mint failed")
+		return
+	}
+	log.Printf("shipd: token created id=%s name=%q", rec.ID, rec.Name)
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id":   rec.ID,
+		"name": rec.Name,
+		// shown exactly once
+		"token":   plain,
+		"created": rec.CreatedAt,
+	})
+}
+
+func (e *Engine) handleTokenRevoke(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !e.st.RevokeToken(id) {
+		httpError(w, http.StatusNotFound, "no such token")
+		return
+	}
+	log.Printf("shipd: token revoked id=%s", id)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
+}
+
 func (e *Engine) handleLogs(w http.ResponseWriter, r *http.Request) {
 	sub := r.PathValue("subdomain")
 	app := e.BySubdomain(sub)
@@ -141,6 +197,10 @@ func (e *Engine) handleCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---- dashboard (design language: plainskill.net Dash) ------------------
+//
+// Anatomy: left-aligned max-w-xl column, #000 bg, white fg, Fira Code,
+// muted #717174, border #1a1a1a, radius 0, label/title/body/badge,
+// quiet text links (no colored buttons).
 
 const dashHTML = `<!doctype html>
 <html>
@@ -151,83 +211,117 @@ const dashHTML = `<!doctype html>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
-  body { background:#000; color:#fff; font: 14px/1.6 "Fira Code", ui-monospace, monospace; margin:0; padding:48px 24px; }
-  .col { max-width: 720px; }
-  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
-  .muted { color: #717174; }
-  .label { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color:#717174; margin: 28px 0 8px; }
-  .app { border: 1px solid #1a1a1a; padding: 14px 16px; margin-bottom: 10px; }
-  .row { display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; }
-  a { color: #fff; text-decoration: underline; text-underline-offset: 3px; text-decoration-color: #3f3f43; }
+  body { background:#000; color:#fff; font: 13px/1.6 "Fira Code", ui-monospace, SFMono-Regular, Menlo, monospace;
+         margin:0; padding:56px 24px; }
+  .col { max-width: 36rem; }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 6px; letter-spacing: -0.01em; }
+  .body { color: #717174; }
+  .label { font-size: 10px; text-transform: uppercase; letter-spacing: .1em; color:#717174; margin: 32px 0 10px; }
+  .panel { border: 1px solid #1a1a1a; padding: 16px; }
+  .panel + .panel { margin-top: 10px; }
+  .row { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+  .grow { flex: 1 1 auto; }
+  a { color: #fff; text-decoration: underline; text-underline-offset: 3px; text-decoration-color: #2a2a2e; }
   a:hover { text-decoration-color: #717174; }
-  .status { font-size: 11px; padding: 1px 8px; border: 1px solid #1a1a1a; }
-  .st-running  { color: #7ee787; border-color: #1f4a2a; }
-  .st-building, .st-queued { color: #d2a8ff; border-color: #3b2a58; }
-  .st-failed   { color: #ff7b72; border-color: #5a2320; }
-  .st-stopped  { color: #717174; }
-  .acts { margin-top: 8px; }
-  .acts button, .acts a { font: inherit; font-size: 12px; background: none; color:#717174;
-      border: 1px solid #1a1a1a; padding: 2px 10px; cursor: pointer; text-decoration: none; }
-  .acts button:hover, .acts a:hover { color: #fff; border-color: #3f3f43; }
-  input { font: inherit; background: #000; color: #fff; border: 1px solid #1a1a1a; padding: 6px 10px; width: 100%; }
+  .badge { font-size: 10px; letter-spacing: .05em; text-transform: uppercase;
+           padding: 1px 8px; border: 1px solid #1a1a1a; color: #717174; white-space: nowrap; }
+  .b-running  { color: #7ee787; border-color: #1f4a2a; }
+  .b-building, .b-queued { color: #d2a8ff; border-color: #3b2a58; }
+  .b-failed   { color: #ff7b72; border-color: #5a2320; }
+  .b-revoked  { color: #717174; text-decoration: line-through; }
+  .meta { color: #717174; font-size: 11px; }
+  .quiet { background: none; border: 0; padding: 0; font: inherit; font-size: 12px; color: #717174;
+           cursor: pointer; text-decoration: underline; text-underline-offset: 3px; text-decoration-color: #2a2a2e; }
+  .quiet:hover { color: #fff; text-decoration-color: #717174; }
+  .quiet.warn:hover { color: #ff7b72; text-decoration-color: #5a2320; }
+  input { font: inherit; font-size: 13px; background: #000; color: #fff; border: 1px solid #1a1a1a;
+          padding: 7px 10px; width: 100%; }
   input:focus { outline: none; border-color: #3f3f43; }
-  form { border: 1px solid #1a1a1a; padding: 14px 16px; }
-  form .field { margin-bottom: 10px; }
-  form button { font: inherit; font-size: 13px; background: #fff; color: #000; border: 0; padding: 6px 18px; cursor: pointer; }
-  form button:hover { background: #d0d0d0; }
+  input::placeholder { color: #4a4a4e; }
+  .field { margin-bottom: 10px; }
+  .actions { margin-top: 10px; }
   .msg { font-size: 12px; margin-top: 10px; white-space: pre-wrap; }
-  .err { color: #ff7b72; font-size: 12px; }
+  .err { color: #ff7b72; }
+  .ok { color: #7ee787; }
+  pre.token { border: 1px solid #1f4a2a; color: #7ee787; padding: 10px 12px; overflow-x: auto;
+              font-size: 12px; margin: 10px 0 0; }
+  .divider { border: 0; border-top: 1px solid #1a1a1a; margin: 0; }
+  footer { margin-top: 40px; }
 </style>
 </head>
 <body>
 <div class="col">
   <h1>shipd</h1>
-  <div class="muted">git in, containers out. single user.</div>
+  <div class="body">git in, containers out. deploys land at &lt;name&gt;.apps.plainskill.net with automatic TLS.</div>
 
   <div class="label">deploy</div>
-  <form id="deploy">
-    <div class="field"><input id="repo" placeholder="https://git.plainskill.net/plainskill/shipd-example.git" required></div>
-    <div class="field"><input id="branch" placeholder="branch (default: main)"></div>
-    <div class="field"><input id="subdomain" placeholder="subdomain — app goes live at &lt;name&gt;.apps.plainskill.net" required></div>
-    <button type="submit">deploy</button>
-    <div class="msg muted" id="deploymsg"></div>
-  </form>
+  <div class="panel">
+    <form id="deploy">
+      <div class="field"><input id="repo" placeholder="git url — https://host/org/repo.git" autocomplete="off" required></div>
+      <div class="field"><input id="branch" placeholder="branch (default: main)" autocomplete="off"></div>
+      <div class="field"><input id="subdomain" placeholder="subdomain — hello" autocomplete="off" required></div>
+      <div class="actions"><button class="quiet" type="submit">deploy &rarr;</button></div>
+      <div class="msg body" id="deploymsg"></div>
+    </form>
+  </div>
 
   <div class="label">apps</div>
-  <div id="apps" class="muted">loading...</div>
+  <div id="apps" class="body">loading...</div>
+
+  <div class="label">api tokens</div>
+  <div class="panel">
+    <form id="tokform">
+      <div class="field"><input id="tokname" placeholder="token name — e.g. laptop, ci, phone" autocomplete="off" required></div>
+      <div class="actions"><button class="quiet" type="submit">create token &rarr;</button></div>
+      <div class="msg body" id="tokmsg"></div>
+      <div id="newtoken"></div>
+    </form>
+  </div>
+  <div id="tokens" class="body" style="margin-top:10px">loading...</div>
+
+  <footer>
+    <hr class="divider">
+    <div class="meta">single-user deploy plane &middot;
+      <a href="/healthz">health</a> &middot;
+      <a href="https://git.plainskill.net/plainskill/shipd">source</a>
+    </div>
+  </footer>
 </div>
 <script>
 function esc(s) { return (s || "").replace(/[&<>"]/g, function(c) {
   return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
 });}
 function shortRepo(u) { return u.replace(/^https?:\/\//, "").replace(/^git@/, "").replace(/\.git$/, ""); }
+function fmtDate(iso) { try { return new Date(iso).toLocaleString(); } catch (e) { return iso; } }
+function badge(status) { return '<span class="badge b-' + esc(status) + '">' + esc(status) + '</span>'; }
 
-function load() {
+function loadApps() {
   fetch("/api/apps").then(function(r) {
     if (r.status === 401) { location.reload(); return null; }
     return r.json();
   }).then(function(apps) {
     if (!apps) return;
     var el = document.getElementById("apps");
-    if (!apps.length) { el.textContent = "no apps yet — deploy one above"; return; }
+    if (!apps.length) { el.textContent = "no apps yet — deploy one above."; return; }
     var html = "";
     for (var i = 0; i < apps.length; i++) {
       var a = apps[i];
-      html += '<div class="app">'
+      html += '<div class="panel">'
         + '<div class="row">'
-        + '<a href="https://' + esc(a.domain) + '/">' + esc(a.subdomain) + '</a>'
-        + '<span class="muted">' + esc(shortRepo(a.repo)) + '@' + esc(a.branch) + (a.git_sha ? '@' + esc(a.git_sha) : '') + '</span>'
-        + '<span class="status st-' + esc(a.status) + '">' + esc(a.status) + '</span>'
+        + '<span class="grow"><a href="https://' + esc(a.domain) + '/">' + esc(a.subdomain) + '</a></span>'
+        + badge(a.status)
         + '</div>'
-        + (a.last_error ? '<div class="err">' + esc(a.last_error) + '</div>' : '')
-        + '<div class="muted" style="font-size:12px">last deploy: ' + esc(a.last_deploy ? new Date(a.last_deploy).toLocaleString() : "never") + '</div>'
-        + '<div class="acts">'
-        + '<a href="/api/apps/' + esc(a.subdomain) + '/logs" target="_blank">logs</a> '
-        + '<button onclick="act(\'' + esc(a.subdomain) + '\',\'redeploy\')">redeploy</button> '
+        + '<div class="meta">' + esc(shortRepo(a.repo)) + ' @ ' + esc(a.branch)
+        + (a.git_sha ? ' @ ' + esc(a.git_sha) : '') + '</div>'
+        + (a.last_error ? '<div class="meta err">' + esc(a.last_error) + '</div>' : '')
+        + '<div class="meta">last deploy: ' + esc(a.last_deploy ? fmtDate(a.last_deploy) : "never") + '</div>'
+        + '<div class="actions">'
+        + '<a href="/api/apps/' + esc(a.subdomain) + '/logs">logs</a> &nbsp; '
+        + '<button class="quiet" onclick="act(\'' + esc(a.subdomain) + '\',\'redeploy\')">redeploy</button> &nbsp; '
         + (a.desired_up
-            ? '<button onclick="act(\'' + esc(a.subdomain) + '\',\'stop\')">stop</button> '
-            : '<button onclick="act(\'' + esc(a.subdomain) + '\',\'start\')">start</button> ')
-        + '<button onclick="act(\'' + esc(a.subdomain) + '\',\'delete\')">delete</button>'
+            ? '<button class="quiet" onclick="act(\'' + esc(a.subdomain) + '\',\'stop\')">stop</button> &nbsp; '
+            : '<button class="quiet" onclick="act(\'' + esc(a.subdomain) + '\',\'start\')">start</button> &nbsp; ')
+        + '<button class="quiet warn" onclick="del(\'' + esc(a.subdomain) + '\')">delete</button>'
         + '</div></div>';
     }
     el.innerHTML = html;
@@ -237,13 +331,57 @@ function load() {
 function act(sub, action) {
   fetch("/api/apps/" + sub + "/" + action, { method: "POST" })
     .then(function(r) { if (r.status === 401) location.reload(); });
-  setTimeout(load, 400);
+  setTimeout(loadApps, 400);
+}
+
+function del(sub) {
+  if (!confirm("delete " + sub + "? container and state are removed.")) return;
+  fetch("/api/apps/" + sub + "/delete", { method: "POST" })
+    .then(function(r) { if (r.status === 401) location.reload(); });
+  setTimeout(loadApps, 500);
+}
+
+function loadTokens() {
+  fetch("/api/tokens").then(function(r) {
+    if (r.status === 401) { location.reload(); return null; }
+    return r.json();
+  }).then(function(toks) {
+    if (!toks) return;
+    var el = document.getElementById("tokens");
+    if (!toks.length) { el.textContent = "no managed tokens. the root token is in /etc/shipd/config.json."; return; }
+    var html = "";
+    for (var i = 0; i < toks.length; i++) {
+      var t = toks[i];
+      var status = t.revoked_at ? "revoked" : "active";
+      html += '<div class="panel">'
+        + '<div class="row">'
+        + '<span class="grow">' + esc(t.name) + '</span>'
+        + badge(status)
+        + '</div>'
+        + '<div class="meta">created ' + esc(fmtDate(t.created_at))
+        + (t.last_used_at ? ' &middot; last used ' + esc(fmtDate(t.last_used_at)) : ' &middot; never used')
+        + '</div>'
+        + (!t.revoked_at
+            ? '<div class="actions"><button class="quiet warn" onclick="revoke(\'' + esc(t.id) + '\',\'' + esc(t.name) + '\')">revoke</button></div>'
+            : '')
+        + '</div>';
+    }
+    el.innerHTML = html;
+  });
+}
+
+function revoke(id, name) {
+  if (!confirm("revoke token '" + name + "'? anything using it stops working.")) return;
+  fetch("/api/tokens/" + id + "/revoke", { method: "POST" })
+    .then(function(r) { if (r.status === 401) location.reload(); });
+  setTimeout(loadTokens, 400);
 }
 
 document.getElementById("deploy").addEventListener("submit", function(ev) {
   ev.preventDefault();
   var msg = document.getElementById("deploymsg");
   msg.textContent = "queueing...";
+  msg.className = "msg body";
   fetch("/api/deploy", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -258,22 +396,51 @@ document.getElementById("deploy").addEventListener("submit", function(ev) {
   }).then(function(res) {
     if (!res) return;
     if (res.ok) {
-      msg.textContent = "queued — status below updates as it builds";
+      msg.textContent = "queued — status updates below as it builds.";
+      msg.className = "msg ok";
       document.getElementById("repo").value = "";
       document.getElementById("branch").value = "";
       document.getElementById("subdomain").value = "";
-      setTimeout(load, 500);
+      setTimeout(loadApps, 500);
     } else {
-      msg.textContent = "";
-      msg.className = "msg err";
       msg.textContent = "error: " + (res.body.error || "unknown");
-      setTimeout(function() { msg.className = "msg muted"; msg.textContent = ""; }, 6000);
+      msg.className = "msg err";
+    }
+    setTimeout(function() { msg.textContent = ""; }, 8000);
+  });
+});
+
+document.getElementById("tokform").addEventListener("submit", function(ev) {
+  ev.preventDefault();
+  var msg = document.getElementById("tokmsg");
+  var box = document.getElementById("newtoken");
+  msg.textContent = "";
+  box.innerHTML = "";
+  fetch("/api/tokens", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: document.getElementById("tokname").value.trim() })
+  }).then(function(r) {
+    if (r.status === 401) { location.reload(); return null; }
+    return r.json().then(function(b) { return { ok: r.ok, body: b }; });
+  }).then(function(res) {
+    if (!res) return;
+    if (res.ok) {
+      box.innerHTML = '<div class="msg ok">token created. copy it now — it is shown once:</div>'
+        + '<pre class="token">' + esc(res.body.token) + '</pre>'
+        + '<div class="msg body">use it: curl -u shipd:' + esc(res.body.token) + ' https://shipd.plainskill.net/api/apps</div>';
+      document.getElementById("tokname").value = "";
+      loadTokens();
+    } else {
+      msg.textContent = "error: " + (res.body.error || "unknown");
+      msg.className = "msg err";
     }
   });
 });
 
-load();
-setInterval(load, 5000);
+loadApps();
+loadTokens();
+setInterval(loadApps, 5000);
 </script>
 </body>
 </html>`
